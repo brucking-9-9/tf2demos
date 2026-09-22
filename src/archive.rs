@@ -126,7 +126,7 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
     }
     // §5: the index must never lag behind a completed move, even when a later move failed.
     if write && stats.moved > 0 {
-        index.save(&index_path)?;
+        save_merging(&index_path, &index, &loaded, &cfg.seed_labels)?;
     }
     loop_result?;
 
@@ -154,7 +154,7 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
 
     // Step 6: index.
     if write && (index != loaded || !index_path.exists()) {
-        index.save(&index_path)?;
+        save_merging(&index_path, &index, &loaded, &cfg.seed_labels)?;
     }
 
     rep.line(format!(
@@ -197,6 +197,28 @@ pub(crate) fn list_demos(demos_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     demos.sort();
     Ok(demos)
+}
+
+/// Save organize's view of the index **without** discarding what the review wizard may have
+/// written since `loaded` was read (labels are precious; the wizard can be open at midnight).
+///
+/// The file is re-read; every entry of `mem` is merged into it with [`Index::merge_archived`]
+/// (file-derived fields from organize, `label/class/rating/streak/reviewed` from disk); entries
+/// organize removed since `loaded` (pruned, or adopted under a new id) are dropped; `labels`
+/// and `last_class` stay as on disk. Entries the wizard added meanwhile survive untouched.
+fn save_merging(path: &Path, mem: &Index, loaded: &Index, seed_labels: &[String]) -> Result<()> {
+    let mut disk = Index::load_or_new(path, seed_labels)?;
+    for entry in &mem.demos {
+        disk.merge_archived(entry.clone(), &[]);
+    }
+    let removed: Vec<&str> = loaded
+        .demos
+        .iter()
+        .filter(|d| mem.by_id(&d.id).is_none())
+        .map(|d| d.id.as_str())
+        .collect();
+    disk.demos.retain(|d| !removed.contains(&d.id.as_str()));
+    disk.save(path)
 }
 
 /// Ids of not-yet-archived entries whose `file` no longer exists: a hot demo the user renamed
@@ -1730,6 +1752,80 @@ what is this
         // The labelled-but-missing entry gets no dangling link.
         assert!(!demos.join("archive/by-label/c-tap").exists());
         fs::remove_dir_all(&t.root).unwrap();
+    }
+
+    /// A label written by the wizard *between* organize's load and its save must survive.
+    #[test]
+    fn save_merging_keeps_concurrent_wizard_writes() {
+        let dir = temp_dir("merge-save");
+        let path = dir.join("index.json");
+        // What organize loaded: X hot, unlabelled; P hot, unlabelled (will be pruned).
+        let mut loaded = Index::new(&["seed".to_string()]);
+        let mut x = entry(
+            "X",
+            "pl_x",
+            at(2026, 9, 21, 19, 51, 20),
+            vec![event(10, &[10], None, None)],
+        );
+        x.file = "demos/X.dem".into();
+        loaded.upsert(x.clone());
+        let mut p = entry(
+            "P",
+            "pl_x",
+            at(2026, 9, 20, 0, 0, 0),
+            vec![event(1, &[1], None, None)],
+        );
+        p.file = "demos/P.dem".into();
+        loaded.upsert(p);
+        // Meanwhile the wizard labelled X, added a fresh hot demo N and a free-text label.
+        let mut disk = loaded.clone();
+        let dx = disk.by_id_mut("X").unwrap();
+        dx.events[0].label = Some("matador".into());
+        dx.events[0].rating = Some(5);
+        dx.reviewed = true;
+        let mut n = entry(
+            "N",
+            "pl_n",
+            at(2026, 9, 21, 20, 0, 0),
+            vec![event(7, &[7], None, None)],
+        );
+        n.file = "demos/N.dem".into();
+        disk.upsert(n);
+        disk.add_label("free text");
+        disk.last_class = Some("spy".into());
+        disk.save(&path).unwrap();
+        // Organize's in-memory result: X archived (still unlabelled in its copy), P pruned.
+        let mut mem = loaded.clone();
+        mem.demos.retain(|d| d.id != "P");
+        let mx = mem.by_id_mut("X").unwrap();
+        mx.file = "demos/archive/2026/09/21/X_pl_x.dem".into();
+
+        save_merging(&path, &mem, &loaded, &[]).unwrap();
+        let out = Index::load_or_new(&path, &[]).unwrap();
+        let ids: Vec<&str> = out.demos.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["X", "N"]);
+        let x = out.by_id("X").unwrap();
+        assert_eq!(
+            x.file, "demos/archive/2026/09/21/X_pl_x.dem",
+            "organize's move wins"
+        );
+        assert_eq!(
+            x.events[0].label.as_deref(),
+            Some("matador"),
+            "wizard's label wins"
+        );
+        assert_eq!(x.events[0].rating, Some(5));
+        assert!(x.reviewed);
+        assert_eq!(out.by_id("N").unwrap().file, "demos/N.dem");
+        assert_eq!(out.labels, ["seed", "free text"]);
+        assert_eq!(out.last_class.as_deref(), Some("spy"));
+        // No file yet: the merge simply creates it from memory.
+        fs::remove_file(&path).unwrap();
+        save_merging(&path, &mem, &loaded, &["seed".to_string()]).unwrap();
+        let out = Index::load_or_new(&path, &[]).unwrap();
+        assert_eq!(out.demos.len(), 1);
+        assert_eq!(out.labels, ["seed"]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Lines of hot demos indexed by the wizard stay in `_events.txt` until the demo moves.
