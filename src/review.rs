@@ -57,6 +57,117 @@ pub struct Answer {
     pub streak: u32,
 }
 
+/// Wall-clock time of a mark: `recorded_at + tick / 66.6667`.
+pub fn mark_time(recorded_at: NaiveDateTime, tick: i64) -> NaiveDateTime {
+    let ms = (tick.max(0) as f64 / demo::TICKS_PER_SEC * 1000.0).round() as i64;
+    recorded_at + chrono::Duration::milliseconds(ms)
+}
+
+/// A field-by-field edit of one event from the CLI (`tf2demos edit`). Outer `None` = leave
+/// alone; inner `None` = clear.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EventPatch {
+    pub label: Option<Option<String>>,
+    pub class: Option<Option<String>>,
+    pub rating: Option<Option<u8>>,
+    pub streak: Option<Option<u32>>,
+    /// Force the demo's `reviewed` flag (`Some(false)` puts its unlabelled marks back in the
+    /// wizard's queue). Otherwise it flips to `true` once every event is labelled.
+    pub reviewed: Option<bool>,
+}
+
+/// Find a demo by `id`, `original_name`, current file stem, or `file`.
+pub fn find_demo<'a>(index: &'a Index, key: &str) -> Option<&'a DemoEntry> {
+    let wanted = key.trim_end_matches(".dem");
+    index.demos.iter().find(|d| {
+        d.id == wanted || d.original_name == wanted || d.file_stem() == wanted || d.file == key
+    })
+}
+
+/// Edit one event of the demo `key` names: the one at `tick` (a raw mark tick also matches), or
+/// the demo's only event when `tick` is `None`. Hot demos not yet indexed are indexed first.
+/// Reloads the index, patches, saves atomically, rebuilds `by-label/`, and returns the entry.
+pub fn edit_event(
+    cfg: &Config,
+    key: &str,
+    tick: Option<i64>,
+    patch: &EventPatch,
+) -> Result<DemoEntry> {
+    let scanned = scan(cfg)?;
+    let found = find_demo(&scanned.index, key)
+        .cloned()
+        .with_context(|| format!("no demo matches {key:?}"))?;
+    let path = cfg.index_path();
+    let mut ix = Index::load_or_new(&path, &cfg.seed_labels)?;
+    if ix.by_id(&found.id).is_none() {
+        ix.upsert(found.clone());
+    }
+    let entry = ix.by_id_mut(&found.id).expect("just ensured");
+    let pos = match tick {
+        Some(t) => entry
+            .events
+            .iter()
+            .position(|e| e.tick == t || e.raw_ticks.contains(&t))
+            .with_context(|| {
+                format!(
+                    "{} has no event at tick {t} (ticks: {})",
+                    entry.id,
+                    entry
+                        .events
+                        .iter()
+                        .map(|e| e.tick.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?,
+        None => match entry.events.len() {
+            1 => 0,
+            0 => bail!("{} has no events", entry.id),
+            n => bail!("{} has {n} events; pass --tick", entry.id),
+        },
+    };
+    let ev = &mut entry.events[pos];
+    if let Some(label) = &patch.label {
+        ev.label = label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from);
+        if ev.label.is_some() && ev.streak.is_none() {
+            ev.streak = Some(1);
+        }
+    }
+    if let Some(class) = &patch.class {
+        ev.class = class
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(String::from);
+    }
+    if let Some(rating) = patch.rating {
+        ev.rating = rating.map(|r| r.clamp(1, 5));
+    }
+    if let Some(streak) = patch.streak {
+        ev.streak = streak.map(|n| n.max(1));
+    }
+    let new_label = ev.label.clone();
+    let new_class = ev.class.clone();
+    entry.reviewed = match patch.reviewed {
+        Some(r) => r,
+        None => entry.reviewed || entry.events.iter().all(|e| e.label.is_some()),
+    };
+    let result = entry.clone();
+    if let Some(l) = &new_label {
+        ix.add_label(l);
+    }
+    if patch.class.is_some() && new_class.is_some() {
+        ix.last_class = new_class;
+    }
+    ix.save(&path)?;
+    archive::rebuild_by_label(cfg, &ix)?;
+    Ok(result)
+}
+
 /// Result of [`scan`]: the index as loaded plus every hot demo not yet in it.
 #[derive(Debug)]
 pub struct Scan {
@@ -436,6 +547,111 @@ mod tests {
         assert_eq!(format_offset(6964), "01:44");
         assert_eq!(format_offset(48085), "12:01");
         assert_eq!(format_offset(-5), "00:00");
+    }
+
+    #[test]
+    fn mark_time_adds_offset() {
+        let t = mark_time(at(2026, 9, 21, 19, 51, 20), 6964);
+        assert_eq!(t.format("%H:%M:%S").to_string(), "19:53:04");
+        assert_eq!(
+            mark_time(at(2026, 9, 21, 0, 0, 0), 0),
+            at(2026, 9, 21, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn edit_event_patches_reloads_and_relinks() {
+        let t = build_tree("edit");
+        // Hot demo, not indexed yet, single event → no --tick needed.
+        let e = edit_event(
+            &t.cfg,
+            "2026-09-21_19-51-20",
+            None,
+            &EventPatch {
+                label: Some(Some(" c-tap ".into())),
+                class: Some(Some("scout".into())),
+                rating: Some(Some(9)),
+                ..EventPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.file, "demos/2026-09-21_19-51-20.dem");
+        assert_eq!(e.events[0].label.as_deref(), Some("c-tap"));
+        assert_eq!(e.events[0].class.as_deref(), Some("scout"));
+        assert_eq!(e.events[0].rating, Some(5));
+        assert_eq!(e.events[0].streak, Some(1), "label without streak → 1");
+        assert!(e.reviewed, "all events labelled → reviewed");
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        assert_eq!(ix.by_id("2026-09-21_19-51-20").unwrap(), &e);
+        assert_eq!(ix.last_class.as_deref(), Some("scout"));
+        assert!(
+            t.root
+                .join("tf/demos/archive/by-label/c-tap/2026-09-21_pl_badwater_t6964_r5.dem")
+                .exists()
+        );
+        // By raw tick, on the archived demo, by file name; clear the rating, force requeue.
+        let e = edit_event(
+            &t.cfg,
+            "2026-08-16_23-04-42_pl_pier.dem",
+            Some(24405),
+            &EventPatch {
+                label: Some(Some("matador".into())),
+                streak: Some(Some(0)),
+                reviewed: Some(false),
+                ..EventPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.id, "2026-08-16_23-04-42");
+        assert_eq!(e.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(e.events[0].streak, Some(1));
+        assert!(!e.reviewed);
+        // Clearing the label puts it back into the queue and the unlabelled link returns.
+        let e = edit_event(
+            &t.cfg,
+            "2026-08-16_23-04-42",
+            None,
+            &EventPatch {
+                label: Some(None),
+                ..EventPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.events[0].label, None);
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        let q = queue(&ix);
+        assert!(q.iter().any(|c| c.demo_id == "2026-08-16_23-04-42"));
+        assert!(
+            t.root
+                .join("tf/demos/archive/by-label/unlabelled/2026-08-16_23-04-42_pl_pier.dem")
+                .exists()
+        );
+        assert!(!t.root.join("tf/demos/archive/by-label/matador").exists());
+        assert_eq!(
+            ix.labels.len(),
+            3,
+            "matador and c-tap were seeds, nothing duplicated"
+        );
+        // Errors: unknown demo, unknown tick, ambiguous tick.
+        assert!(edit_event(&t.cfg, "nope", None, &EventPatch::default()).is_err());
+        let err = edit_event(
+            &t.cfg,
+            "2026-08-16_23-04-42",
+            Some(5),
+            &EventPatch::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("24405"), "{err}");
+        let mut ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        ix.by_id_mut("2026-08-16_23-04-42")
+            .unwrap()
+            .events
+            .push(ev(30000, None));
+        ix.save(&t.cfg.index_path()).unwrap();
+        let err =
+            edit_event(&t.cfg, "2026-08-16_23-04-42", None, &EventPatch::default()).unwrap_err();
+        assert!(err.to_string().contains("--tick"), "{err}");
+        fs::remove_dir_all(&t.root).unwrap();
     }
 
     #[test]
