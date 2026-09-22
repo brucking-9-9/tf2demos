@@ -949,7 +949,15 @@ mod tests {
         assert_eq!(rep.stats.folded, 1, "{:?}", rep.lines);
         let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
         let d = ix.by_id("Nice stab").unwrap();
+        // Day and time come from the ds name, not the mtime of the renamed file (this also
+        // keeps the test independent of the build sandbox's timezone).
         assert_eq!(d.file, "demos/archive/2026/09/21/Nice stab_pl_badwater.dem");
+        assert_eq!(d.recorded_at, at(2026, 9, 21, 19, 51, 20));
+        assert!(
+            demos
+                .join("archive/2026/09/21/Nice stab_pl_badwater.json")
+                .is_file()
+        );
         assert_eq!(d.original_name, "2026-09-21_19-51-20");
         assert_eq!(d.events[0].labels, ["matador"]);
         assert_eq!(fs::read_to_string(demos.join("_events.txt")).unwrap(), "");

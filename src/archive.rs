@@ -335,7 +335,13 @@ fn process_demo(
         }
     };
 
-    let recorded = recorded_at(&stem, mtime, header.seconds);
+    // A demo the user renamed after it was indexed keeps the precise time from its ds name
+    // (`original_name`), so it lands in the right day and the day log stays in order.
+    let recorded = index
+        .by_id(&stem)
+        .filter(|d| demo::parse_ds_name(&d.original_name).is_some())
+        .map(|d| d.recorded_at)
+        .unwrap_or_else(|| recorded_at(&stem, mtime, header.seconds));
     let new_name = new_demo_name(&stem, &header.map);
     let day = day_dir(recorded);
     let dest_dir = archive_path.join(&day);
