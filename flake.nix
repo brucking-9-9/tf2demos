@@ -65,6 +65,8 @@
           '';
           doCheck = false;
           installPhase = "touch $out";
+          # Nothing to wrap: the package's wrapProgram would fail on the empty output.
+          postFixup = "";
         });
       });
 
