@@ -1,323 +1,339 @@
-# tf2demos — implementer's operating manual
+# tf2demos — implementer's operating manual (session 2)
 
-Read this whole file before doing anything. `HANDOFF.md` in this directory is the
-full spec (data formats, decisions, architecture, the original Q&A). This file is
-the **operating manual** for the session that builds it: what to build first, which
-rules to obey, where HANDOFF is now out of date, and where to stop and ask.
+Read this whole file before doing anything. `HANDOFF.md` is the original spec
+(data formats, decisions, architecture, the user's verbatim Q&A). This file is the
+**operating manual**: what exists, what session 2 builds, which rules to obey,
+where HANDOFF is out of date, and where to stop and ask.
 
 **Where this file and HANDOFF.md disagree, this file wins.** Do not edit HANDOFF.md.
 
-Written 2026-09-21 after a second Q&A round with the user (brucking). Everything
-marked **[user]** was decided by them; **[verified]** was checked on this machine.
+Rewritten 2026-09-21 at the end of session 1. **[user]** = decided by brucking;
+**[verified]** = checked on this machine; **[s1]** = decided by the session-1
+implementer under §5 autonomy and visible to the user in the final report.
 
 ---
 
 ## 1. Read this first
 
 **What it is.** A Rust tool that manages Team Fortress 2 demos recorded by TF2's
-built-in `ds_*` demo support. Long-term it grows into a GUI with a labelling
-wizard (HANDOFF §1). **This session builds only the daily organizing job**: a
-`tf2demos organize` subcommand, packaged by a Nix flake, run by a systemd user
-timer that a home-manager module installs.
+built-in `ds_*` demo support. Session 1 shipped the daily organizing job and it
+is **live on this machine**: `tf2demos organize` runs from a systemd user timer
+installed by this repo's home-manager module. Session 2 builds the
+"prompted after each session" loop **[user, 2026-09-21]**: a TF2-exit watcher,
+a mako notification, an egui **review wizard** that labels marks, and
+**play-at-tick**. The Events/Demos tabs, the timeline widget, and the
+freeze/thaw cold store are session 3+ (§8).
 
-**Environment you are in** [verified]:
-- NixOS unstable, flake at `/etc/nixos`, host `19BK`, Wayland (niri). The user's
-  global rules live in `~/.claude/CLAUDE.md` and apply here too (nix-native only,
-  `/etc/nixos` top level is root-owned, `switch` alias rebuilds).
-- **No `cargo`, `rustc`, or `rust-analyzer` on PATH.** nixpkgs has Rust 1.97.x.
-  The toolchain comes from this repo's `flake.nix` devShell: run everything via
-  `nix develop -c <cmd>` (or `nix develop` then work inside the shell).
-- **TF2 may be running at any moment**, including while you work. Do not launch
-  it, kill it, or assume it is closed. Check with
-  `pgrep -f 'tf_linux64|hl2_linux'`.
-- The real demo directory is
-  `/home/brucking/.local/share/Steam/steamapps/common/Team Fortress 2/tf/demos/`
-  (below: `tf/demos`). **The user cares about every file in it.** Develop and
-  test against a copy in your scratchpad directory (§5). Read-only commands
-  (`ls`, `head -c 1072`, `organize --dry-run`) against the real directory are fine.
-- Project git identity is already configured globally (`brucking-9-9`,
-  `bruck@tekle.com`). SSH auth only, no `gh`, no HTTPS tokens.
+**Environment** [verified 2026-09-21]:
+- NixOS unstable, flake at `/etc/nixos`, host `19BK`, Wayland (niri + waybar +
+  kitty + mako). The user's global rules in `~/.claude/CLAUDE.md` apply
+  (nix-native only, `/etc/nixos` top level is root-owned, `switch` alias rebuilds).
+- **No `cargo`/`rustc` on PATH.** Everything runs through this repo's devShell:
+  `nix develop -c cargo <...>`. The shell is cached; nixpkgs is pinned in
+  `flake.lock` to the running system's rev (`c043004d…`, Rust 1.97.1). If the
+  system has moved since (a weekly flake-update timer exists), re-pin with
+  `nix flake lock --override-input nixpkgs github:nixos/nixpkgs/$(nixos-version --json | jq -r .nixpkgsRevision)`
+  so `nix develop` reuses the cached toolchain.
+- **TF2 may be running at any moment.** Do not launch it, kill it, or assume it
+  is closed. **Do not trust `pgrep -f 'tf_linux64|hl2_linux'`**: it matched its
+  own wrapper shell in session 1 and reported TF2 running when it was not. Use
+  `ps -eo args | grep -E '^\S*(tf_linux64|hl2_linux)' | grep -v grep`, or the
+  tool's own `tf2::is_running()` (reads `/proc/*/comm`).
+- Real demo directory: `/home/brucking/.local/share/Steam/steamapps/common/Team Fortress 2/tf/demos/`
+  (below: `tf/demos`). **The user cares about every file in it.** Its layout now:
+  ```
+  tf/demos/<hot demos>.dem + .json     # under 24 h old, ds names or hand-renamed
+  tf/demos/_events.txt                 # ds master log, lines for hot demos only
+  tf/demos/archive/YYYY/MM/DD/<stem>_<map>.dem + .json + events.txt
+  tf/demos/archive/by-label/<label>/<link>.dem   # regenerated every run, relative symlinks
+  tf/demos/archive/events-orphans.txt
+  tf/demos/archive/index.json          # the only mutable state
+  ```
+  Read-only commands against it are fine (`ls`, `cat index.json`,
+  `tf2demos organize --dry-run`). **Every development run uses a scratch copy** (§6).
+- Git: `main`, remote `origin = git@github.com:brucking-9-9/tf2demos.git`
+  (public; SSH only, no `gh`, no HTTPS tokens). Identity is configured globally.
+  Trailer on every commit: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
 ---
 
-## 2. Corrections to HANDOFF.md
+## 2. What exists (end of session 1) [verified]
 
-| HANDOFF says | Now **[user]** unless noted |
+```
+tf2demos/
+├── flake.nix            # devShell, packages.default (buildRustPackage, fileset src),
+│                        # checks.{tests,clippy}, homeManagerModules.default
+├── nix/hm-module.nix    # { self }: { config, lib, pkgs, ... }: services.tf2demos.*
+├── Cargo.toml           # edition 2024; deps: anyhow chrono clap serde serde_json toml walkdir
+├── src/main.rs          # clap: `--config <path>` (env TF2DEMOS_CONFIG), subcommand `organize [--dry-run]`
+├── src/demo.rs          # Header::{parse,read,is_in_progress}, Sidecar::{parse,read}, Mark,
+│                        # GroupedEvent, group_marks(), parse_ds_name(), TICKS_PER_SEC, HEADER_LEN
+├── src/config.rs        # Config::{load,load_from,parse}, demos_dir(), archive_path(),
+│                        # index_path(), events_master_path(); never writes the file
+├── src/index.rs         # Index::{new,load_or_new,parse,save(atomic),by_id,by_original_name,
+│                        # upsert,add_label}; DemoEntry, Event{tick,presses,raw_ticks,label,
+│                        # class,rating,streak}, State{Hot,Frozen}
+├── src/tf2.rs           # is_running() via /proc; env override TF2DEMOS_TF2_RUNNING=0|1
+├── src/archive.rs       # organize()/organize_with(); pure helpers new_demo_name(),
+│                        # recorded_at(), parse_events_line(), classify_fold(), plan_fold(),
+│                        # by_label_link_name(), by_label_links(), relative_link_target()
+└── tests/fixtures/      # 1072-byte .hdr per real demo + real .json sidecars (see §3 table)
+```
+63 unit tests; `nix flake check` runs tests + `clippy -D warnings`. Read
+`src/archive.rs` before changing anything that touches the index: the labelling
+flow in session 2 depends on how `organize` upserts entries (§4 step 0).
+
+**Index schema** (`archive/index.json`, version 1) — HANDOFF §4 with these changes:
+- Event field `streak: Option<u32>` replaces `length_s` **[user]**.
+- Top-level `labels: Vec<String>` (seeded from config `seed_labels` on first
+  creation; free-text labels append here via `Index::add_label`) and
+  `last_class: Option<String>`.
+- `id` = the stem as found on disk at archive time (`2026-09-21_19-51-20` or
+  `Tight_scout_m`), same as `original_name` **[s1]**. `file` is relative to
+  `tf_dir` (`demos/archive/2026/09/21/...dem`). `recorded_at` is a local-time
+  `NaiveDateTime` serialized `2026-09-21T19:51:20`.
+- `label/class/rating/streak` serialize as `null` when unset; `frozen_in` is omitted when `None`.
+
+**Config** (`~/.config/tf2demos/config.toml`, read-only store symlink generated by
+the HM module; the app never writes it): `tf_dir`, `archive_dir = "demos/archive"`,
+`age_hours = 24`, `group_secs = 2.0`, `seed_labels`, `classes`. Missing file →
+built-in defaults (same values). Unknown keys are an error, so **new keys need
+both `src/config.rs` and `nix/hm-module.nix`**.
+
+**HM module** `services.tf2demos.{enable, package, settings.<key>, onCalendar}`.
+`settings` is a submodule with `freeformType = (pkgs.formats.toml {}).type` so one
+key can be overridden. When enabled: `home.packages`, `xdg.configFile."tf2demos/config.toml"`,
+`systemd.user.services.tf2demos-organize` (oneshot, Nice 10, idle IO, no
+environment needed) and `.timers.tf2demos-organize` (`OnCalendar = "daily"`,
+`Persistent`, `RandomizedDelaySec = "10min"`).
+
+**Deployment** [verified]: `/etc/nixos/flake.nix` has input
+`tf2demos = { url = "github:brucking-9-9/tf2demos"; inputs.nixpkgs.follows = "nixpkgs"; }`;
+`/etc/nixos/home/modules/tools/tf2demos.nix` imports the module and enables it;
+`home/modules/default.nix` imports that file. The lock pins rev `cc331fc`.
+**After every push the lock must move** before `switch` sees the new code:
+- `sudo -H nixos-rebuild switch --flake /etc/nixos --update-input tf2demos` — the
+  NOPASSWD rule covers `nixos-rebuild` with any arguments [verified in sudoers];
+  the flag is listed in `nixos-rebuild --help` [verified] but the end-to-end
+  path is **unverified**. Fallback: the user runs `sudo nix flake update tf2demos --flake /etc/nixos`
+  (password), then `switch`.
+- To test the HM module from the local checkout **before** pushing:
+  `--override-input tf2demos git+file:///home/brucking/Projects/tf2demos`
+  (use `git+file:`, not `path:` — `path:` copies the untracked `target/` into the
+  store). Also unverified. Both are `switch` = checkpoint §5.4.
+- Then `~/.dots/sync-nixos.sh "<msg>"` mirrors `/etc/nixos` to GitHub.
+
+**Live state** [verified 2026-09-21 22:00]: timer `tf2demos-organize.timer` next
+fires 2026-09-22 00:04; first real run archived `2026-08-16_23-04-42` (pl_pier)
+and `2026-09-09_22-09-51` (pl_borneo); three demos from 2026-09-21 are still hot;
+`events-orphans.txt` holds the 7 lines for the two hand-deleted demos.
+
+---
+
+## 3. Corrections to HANDOFF.md (cumulative)
+
+| HANDOFF says | Now |
 |---|---|
-| A watcher runs aging when TF2 exits (§3 Trigger, §4 Watcher loop) | Organizing is a **daily systemd user timer**, unrelated to whether TF2 is running. The TF2-exit watcher exists only to prompt for labelling and is a **later session**. |
-| "Never touch `tf/demos` while TF2 is running" (§3 Aging, §6) | Dropped for moves and deletes. The guard is the **24 h mtime threshold**: a demo cannot be 24 h old while still recording, and TF2 only plays archived demos by explicit path. Kept for **exactly one step**: rewriting `_events.txt`, because ds appends to that file mid-game. If `pgrep -f 'tf_linux64\|hl2_linux'` matches, skip the `_events.txt` rewrite (log "skipped, TF2 running") and do it on the next run. Everything else proceeds. |
-| Fold `_events.txt` into day files, then truncate it (§3 Events log) | Fold **only the lines whose demo is now in the archive**, then **rewrite** `_events.txt` with the remaining lines (a demo under 24 h keeps its lines until it is archived). Lines whose demo exists neither in `tf/demos` nor in the archive nor in the index go to `archive/events-orphans.txt` (append, then remove from master). Match lines by the **original** ds name, e.g. `"2026-09-21_19-54-00"`, which the index stores as `original_name`. Two orphan lines exist today [verified]: demos `2026-09-20_17-22-21` and `2026-09-20_17-39-14` were deleted by hand. |
-| Event field "length" = clip length in seconds (§3 Event fields, §4 index `length_s`) | The field is **`streak`**: an integer, the kill streak / combo length of the play. Default `1`. Replace `length_s` everywhere. |
-| Rename everything to `<date>_<map>.dem` (§3 Naming) | ds-named demos (`YYYY-MM-DD_HH-MM-SS`) → `<date>_<map>.dem`. **Hand-renamed** demos keep the user's name and get the map appended: `Tight_scout_m.dem` → `Tight_scout_m_pl_badwater.dem`. `recorded_at` for those = `mtime − header seconds`. `original_name` in the index is the name as found on disk. |
-| by-label symlinks only for labelled demos (§3 Symlinks, §4) | **Every archived demo always has a symlink.** Unlabelled: `archive/by-label/unlabelled/<stem>.dem` where `<stem>` is the archived filename without extension. Labelled (later session): `archive/by-label/<label>/<date>_<map>_t<tick>_r<rating>.dem`. Symlinks are **relative** (`../../2026/09/21/x.dem`) so the tree survives a move of `tf/`. The whole `by-label/` tree is deleted and regenerated from the index on every run. Implement the naming function for both cases now, even though labels do not exist yet. |
-| Freeze to a nested zip after 30 days (§3 Cold store, §4 Nested zip) | **Deferred. Do not build.** No `cold.rs`, no `zip` crate, no `freeze_days`/`cold_zip` config keys. When it is built later, sub-zips are **one per calendar day**, never per play session. |
-| Subcommand `age` (§4 main.rs) | Named **`organize`**. It does age + rename + day `events.txt` + `_events.txt` fold + `by-label/` regeneration + index update in one pass. `--dry-run` prints every action it would take and writes nothing. |
-| Flake input `path:/home/brucking/Projects/tf2demos` (§4 Nix) | `github:brucking-9-9/tf2demos`, a **public** repo (root fetches it during `switch`; private would need tokens, which the user forbids). |
-| Config key `poll_secs`, `freeze_days`, `cold_zip` | Not in session 1. Keep `tf_dir`, `archive_dir`, `age_hours`, `group_secs`, `seed_labels`, `classes`. |
+| Watcher runs aging on TF2 exit (§3 Trigger, §4 Watcher loop) | **[user]** Organizing is the daily timer, done. The watcher exists **only** to prompt for labelling: on TF2 exit, count unlabelled marks and notify. It never moves or deletes files. |
+| "Never touch `tf/demos` while TF2 is running" (§3, §6) | **[user]** Dropped except for the `_events.txt` rewrite, which `organize` skips while TF2 runs (`SKIP fold, TF2 running`). Session 2 writes to `index.json` only, which TF2 never touches; no TF2 gate needed for labelling. |
+| Fold `_events.txt` into day files, then truncate (§3) | Done as: lines for archived demos → `# ds: <raw line>` appended to the day `events.txt`, master rewritten with the remaining lines. Lines matching nothing are orphaned **unless younger than `age_hours`** **[s1]** (protects hand-renamed hot demos like `Tight_scout_m`, whose ds name is gone from disk before it ages in). Hand-renamed demos are matched by `recorded_at ± 5 s` + tick ∈ `raw_ticks`. |
+| Event field `length` (§3, §4) | **[user]** `streak: integer`, default 1 when the user leaves it blank. |
+| Rename everything to `<date>_<map>.dem` (§3) | Rule is `<stem>_<map>.dem` for every demo; ds names and hand-renamed names alike. Sidecar renamed alongside **[s1]**. |
+| by-label symlinks only for labelled demos | Every archived demo has a link. Unlabelled: `by-label/unlabelled/<stem>.dem`. Labelled: `by-label/<label>/<YYYY-MM-DD>_<map>_t<tick>_r<rating or 0>.dem`, one per labelled event, none in `unlabelled` once any event is labelled. `by_label_link_name()` already implements both; regeneration happens on every `organize` run. **Session 2 must call the same regeneration after saving labels** so the tree updates without waiting for the timer. |
+| Watcher notification `-A default=Review` (§4) | Still **[assumed]**; verify once with a manual `notify-send` (mako `default-timeout = 5000` [verified in `mako.nix`], so `-t 0` is required). |
+| Freeze after 30 days, nested zip (§3, §4) | **Deferred again.** No `cold.rs`, no `zip` crate, no `freeze_days`/`cold_zip` keys. Sub-zips are one per calendar day when it comes. |
+| Subcommands `gui | review | watch | age | freeze | thaw | play | search | index` (§4) | Exist: `organize`. Session 2 adds `watch`, `review`, `play`. `gui` (tabs) is session 3. |
+| Config keys `poll_secs`, `freeze_days`, `cold_zip` | Session 2 adds `poll_secs` (default 5). The other two stay out. |
+| Flake input `path:/home/brucking/Projects/tf2demos` | `github:brucking-9-9/tf2demos`, public, done. |
 
-Unchanged and still authoritative: `.dem` header layout and sidecar JSON (§2 File
-formats), the 2 s mark grouping, the index schema in §4 (with `streak`), the
-config file location and the rule that the app **never writes** `config.toml`.
+Unchanged and authoritative: `.dem` header layout and sidecar JSON (HANDOFF §2),
+2 s grouping, palette table (§2), review wizard behaviour (§4), playback helper (§4),
+keyboard map (§3 Input), the rule that the app never writes `config.toml`/`theme.toml`.
 
----
-
-## 3. Session-1 scope, in build order
-
-Stop after step 8. GUI, review wizard, watcher, play, freeze are §7.
-
-### Step 1 — repo skeleton
-- `git init` (branch `main`), `.gitignore` with `target/` and `result`.
-- `Cargo.toml`: package `tf2demos`, edition 2024, binary `tf2demos`. Dependencies
-  for this session only: `clap` (derive), `serde`, `serde_json`, `toml`, `chrono`,
-  `anyhow`, `walkdir`. **No `eframe`/`egui` yet**, so the Nix package needs no
-  Wayland/GL runtime dependencies and `buildRustPackage` stays trivial.
-- `flake.nix` outputs:
-  - `devShells.default`: `cargo rustc rust-analyzer clippy rustfmt`.
-  - `packages.default`: `rustPlatform.buildRustPackage` with
-    `cargoLock.lockFile = ./Cargo.lock`, `meta.mainProgram = "tf2demos"`.
-  - `checks`: run `cargo test` and `cargo clippy -- -D warnings` (e.g. via
-    `packages.default.overrideAttrs` with `checkPhase`, or a small derivation).
-  - `homeManagerModules.default` (step 5). A bare `import ./nix/hm-module.nix`
-    cannot see this flake's package, so wrap it:
-    `homeManagerModules.default = { pkgs, lib, ... }@args: (import ./nix/hm-module.nix args) // { config.services.tf2demos.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default; }`
-    or, cleaner, have `nix/hm-module.nix` take `self` as an extra argument:
-    `homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };`
-    with the module file written as `{ self }: { config, lib, pkgs, ... }: { ... }`.
-- **Pin this flake's nixpkgs to the system's rev** so `nix develop` reuses the
-  cached toolchain and the `follows` in `/etc/nixos` changes nothing. Find the
-  rev with:
-  ```
-  nix flake metadata /etc/nixos --json | jq '.locks.nodes | to_entries[] | select(.key|test("nixpkgs")) | {key, rev: .value.locked.rev, date: .value.locked.lastModified}'
-  ```
-  The lock node is not necessarily named plain `nixpkgs` and an earlier probe
-  returned a suspiciously old rev, so cross-check with
-  `nixos-version --json | jq -r .nixpkgsRevision`, which reports the rev of the
-  **running** system; that is the one to pin against. Then
-  `nix flake lock --override-input nixpkgs github:nixos/nixpkgs/<rev>`.
-- Generate the lockfile inside the shell: `nix develop -c cargo generate-lockfile`.
-  Commit `Cargo.lock`; the Nix build needs it.
-
-### Step 2 — `src/demo.rs`: header, sidecar, grouping
-- Header parser per HANDOFF §2 table (1072 bytes, little-endian, `HL2DEMO\0`
-  magic, strings are NUL-padded `char[260]`). Return a struct with server, client,
-  map, seconds, ticks, frames. Reject files shorter than 1072 bytes or with a bad
-  magic with a clear error.
-- Sidecar parser: `{"events":[{"name","value","tick"}]}`; tabs and a blank line
-  inside the object are normal. Unknown `name` values pass through.
-- Grouping: sort marks by tick, merge any within `group_secs` (66.6667 ticks/s)
-  of the previous mark into one event with `presses` = count and `raw_ticks`.
-- **Tests with committed fixtures.** Cut the first 1072 bytes of every real
-  demo into `tests/fixtures/<name>.hdr` (`head -c 1072 "<tf>/demos/<name>.dem"`)
-  and copy the real `.json` sidecars beside them. These are tiny. Expected
-  values [verified 2026-09-21]:
-
-  | file | map | ticks | seconds | marks (grouped) |
-  |---|---|---|---|---|
-  | `2026-08-16_23-04-42` | `pl_pier` | 32562 | 488.43 | 1 → 1 event |
-  | `2026-09-09_22-09-51` | `pl_borneo` | 107751 | 1616.27 | 4 (48085…48181) → 1 event, 4 presses |
-  | `2026-09-21_00-00-37` | `pl_phoenix` | 23879 | 358.18 | 3 (18564…18590) → 1 event, 3 presses |
-  | `2026-09-21_19-51-20` | `pl_badwater` | 6978 | 104.67 | 1 → 1 event |
-  | `Tight_scout_m` | `pl_badwater` | 2453 | 36.79 | 1 (2291) → 1 event |
-  | `2026-09-21_20-42-43` | `pl_thundermountain` | 0 | 0.0 | no sidecar: was recording when checked |
-
-  Every header has demo protocol 3, network protocol 24, client `brucking`, game dir `tf`.
-  The last row is the in-progress case: ticks 0 and no `.json`. It must parse
-  without error and be reported as "in progress / unfinished".
-
-### Step 3 — `src/config.rs` and `src/index.rs`
-- Config: `~/.config/tf2demos/config.toml`, overridable by `--config <path>` and
-  env `TF2DEMOS_CONFIG`. Keys and defaults (HANDOFF §4, trimmed):
-  ```toml
-  tf_dir      = "/home/brucking/.local/share/Steam/steamapps/common/Team Fortress 2/tf"
-  archive_dir = "demos/archive"   # relative to tf_dir so `playdemo demos/archive/...` works
-  age_hours   = 24
-  group_secs  = 2.0
-  seed_labels = ["surf stab", "c-tap", "matador"]
-  classes     = ["scout","soldier","pyro","demoman","heavy","engineer","medic","sniper","spy"]
-  ```
-  The file is a read-only Nix store symlink on this box. **The app never writes it.**
-- Index: `<tf_dir>/<archive_dir>/index.json`, schema from HANDOFF §4 with
-  `streak` (integer) instead of `length_s`, plus top-level `labels` (seeded from
-  `seed_labels` on first creation, growable later) and `last_class`. Load,
-  save (atomic: write `index.json.tmp` then rename), lookup by `id` and by
-  `original_name`. All mutable state lives here.
-
-### Step 4 — `src/archive.rs` and `tf2demos organize [--dry-run]`
-Rules, applied to `<tf_dir>/demos` (non-recursive, skipping `archive/`):
-1. Candidate = every `*.dem` whose mtime is older than `age_hours`. Anything
-   newer is skipped and logged as "too new".
-2. Candidate **with** a `.json` sidecar → parse header + sidecar → destination
-   `archive/<YYYY>/<MM>/<DD>/` from `recorded_at` (filename date for ds names,
-   `mtime − seconds` otherwise) → new name per §2 → move `.dem` and `.json`
-   (rename within the same filesystem; verify destination exists and sizes
-   match before treating the move as done) → add/replace the index entry →
-   append a line to `archive/<Y>/<M>/<D>/events.txt` per grouped event
-   (`<new name>  tick=<tick> presses=<n> label=- class=- rating=- streak=-`).
-3. Candidate **without** a sidecar → **delete** (these are `ds_autodelete`
-   leftovers or crashed recordings). Log the name and size. Never delete a
-   `.dem` that has a sidecar.
-4. Fold `_events.txt` per §2 (skip the rewrite if TF2 is running).
-5. Delete and regenerate `archive/by-label/` from the index.
-6. Save the index.
-- Every action is one line on stdout (`MOVE`, `DELETE`, `FOLD`, `ORPHAN`,
-  `LINK`, `SKIP <reason>`); stdout lands in the journal under the timer.
-- `--dry-run` performs steps 1–5 in memory and prints the same lines prefixed
-  `[dry-run]`, writing nothing.
-- **Idempotent**: running `organize` twice on an organized tree changes nothing
-  and the second run prints only `SKIP` lines or nothing.
-- Refuse to run without `--dry-run` if `<tf_dir>/demos` does not exist (guards a
-  wrong `tf_dir`).
-
-### Step 5 — `nix/hm-module.nix`
-Model on `/etc/nixos/home/modules/terminal/ai/claude_code.nix` lines 221–250
-(`claude-flake-report`: oneshot service + `Persistent = true` timer). "Use NixOS
-to its fullest" **[user]** means: typed options, generated config, declarative
-timer, nothing hand-installed.
-- `options.services.tf2demos.enable = lib.mkEnableOption "...";`
-- `options.services.tf2demos.settings` typed as `(pkgs.formats.toml {}).type`,
-  defaults = the config block in step 3.
-- `options.services.tf2demos.package` defaulting to this flake's package.
-- `config` when enabled: `home.packages = [ cfg.package ]`,
-  `xdg.configFile."tf2demos/config.toml".source = settingsFormat.generate ...`,
-  `systemd.user.services.tf2demos-organize` (`Type = "oneshot"`,
-  `ExecStart = "${lib.getExe cfg.package} organize"`, `Nice = 10`,
-  `IOSchedulingClass = "idle"`), `systemd.user.timers.tf2demos-organize`
-  (`OnCalendar = "daily"`, `Persistent = true`, `RandomizedDelaySec = "10min"`,
-  `Install.WantedBy = [ "timers.target" ]`).
-- The service needs no Wayland/DBus environment in this session (no
-  notifications yet).
-
-### Step 6 — prove it locally
-Run the §6 checklist against the scratch copy **before** any git push or
-`/etc/nixos` change. Iterating through GitHub is slow (push → lock update in
-root-owned `/etc/nixos` → `switch`), so develop entirely inside this flake and
-wire it in once at the end.
-
-### Step 7 — git and GitHub
-- Commit as work lands, short conventional messages, `Co-Authored-By` trailer
-  per the global rules.
-- **CHECKPOINT (§4.3):** ask the user to create the empty **public** repo
-  `brucking-9-9/tf2demos` on github.com (no README, no license, so the first push
-  is clean). Then:
-  ```
-  git remote add origin git@github.com:brucking-9-9/tf2demos.git
-  git push -u origin main
-  ```
-
-### Step 8 — wire into `/etc/nixos`
-**CHECKPOINT (§4.2) before touching anything here**; `flake.nix` is root-owned.
-1. `flake.nix` input:
-   ```nix
-   tf2demos = {
-     url = "github:brucking-9-9/tf2demos";
-     inputs.nixpkgs.follows = "nixpkgs";
-   };
-   ```
-2. New `home/modules/tools/tf2demos.nix` (user-owned dir, no sudo to create):
-   ```nix
-   { inputs, ... }:
-   {
-     imports = [ inputs.tf2demos.homeManagerModules.default ];
-     services.tf2demos.enable = true;
-   }
-   ```
-   `inputs` reaches HM modules through `extraSpecialArgs` already [verified].
-3. Add `./tools/tf2demos.nix` to the imports list in `home/modules/default.nix`.
-4. The user must stage the new file (`.git` is root-owned):
-   `sudo git -C /etc/nixos add home/modules/tools/tf2demos.nix`.
-5. Test build without root, from your scratchpad:
-   `nix build /etc/nixos#nixosConfigurations."19BK".config.system.build.toplevel --out-link <scratchpad>/result --no-write-lock-file`
-   (never create `./result` inside `/etc/nixos`). The new input needs a
-   `flake.lock` entry and the lock is root-owned, so without
-   `--no-write-lock-file` the unprivileged build errors out; with it, expect a
-   warning. Alternatively the user runs `sudo nix flake lock /etc/nixos`
-   (password prompt, not NOPASSWD). `switch` runs as root and writes the lock.
-6. **CHECKPOINT (§4.4):** `switch`. Then `~/.dots/sync-nixos.sh "tf2demos: organize timer"`.
-- Optional, **unverified**: `nixos-rebuild switch --flake /etc/nixos --override-input tf2demos path:/home/brucking/Projects/tf2demos`
-  may let you test the HM module before pushing. Confirm the flag is accepted
-  by this `nixos-rebuild` before relying on it.
+Fixture expectations [verified] (`tests/fixtures/`): `2026-08-16_23-04-42` pl_pier
+32562 ticks; `2026-09-09_22-09-51` pl_borneo 107751, 4 marks → 1 event;
+`2026-09-21_00-00-37` pl_phoenix 23879, 3 → 1; `2026-09-21_19-51-20` pl_badwater
+6978; `Tight_scout_m` pl_badwater 2453; `2026-09-21_20-42-43` pl_thundermountain
+0 ticks = in progress (**synthetic** header; the real file was deleted before
+session 1 started **[s1]**).
 
 ---
 
-## 4. Hard checkpoints — stop and ask; everything else is autonomous **[user]**
+## 4. Session-2 scope, in build order
 
-1. The first run of `organize` **without** `--dry-run` against the real `tf/demos`.
-2. Any edit to a root-owned file in `/etc/nixos` (`flake.nix`, `configuration.nix`),
-   and any `sudo git -C /etc/nixos add` (the user runs it).
-3. `git push` (the user must have created the repo first).
-4. `nixos-rebuild switch` / the `switch` alias.
-5. Launching TF2 (`steam -applaunch 440`) for any reason. Not expected this session.
-   If it ever is: `~/.claude/skills/run-tf2/SKILL.md` explains why it seizes the desktop.
+Stop after step 8. Confirm this scope with the user in your first message; it was
+chosen 2026-09-21 as "watcher + review wizard + play", with GUI tabs and freeze later.
 
-Design questions that are not on this list: decide, note the assumption in your
-final message, keep going.
+### Step 0 — decide how hot demos get labelled (design gap, decide at start)
+The review must cover demos that are **not archived yet** (a session's demos are
+under 24 h old when TF2 exits). Today only archived demos are in the index, and
+`Index::upsert` **replaces** an entry with the same `id`. Recommended **[s1 proposal]**:
+- At review time, insert hot demos into the index with `file = "demos/<stem>.dem"`,
+  `state = Hot`, events from the sidecar (`group_marks`). `id`/`original_name` =
+  on-disk stem, exactly what `organize` will use later, so the ids line up.
+- Change `organize` so that when it archives a demo whose `id` is already in the
+  index it **merges**: keeps `label/class/rating/streak/reviewed` per event
+  (match by `tick`), updates `file`, `map`, header fields. Add a test: label a hot
+  entry, run `organize`, labels survive. Never let an `organize` run drop a label.
+- The review queue = every event with `label == null` across hot + archived
+  demos, oldest first; hot demos are read from `tf/demos/*.json` directly for
+  demos not yet in the index. Skip in-progress demos (no `.json`).
+Write the decision into your final message. If you pick something else, keep the
+invariant: **`organize` after `review` loses nothing.**
+
+### Step 1 — `src/tf2.rs`: launch, clipboard, `tf2demos play`
+- `play(demo_rel_path, tick)` per HANDOFF §4 Playback helper: TF2 running →
+  `wl-copy "playdemo <rel>; demo_gototick <tick>"` + `notify-send`; TF2 closed →
+  `steam -applaunch 440 -novid +playdemo <rel> +demo_gototick <tick>`.
+  `<rel>` is relative to `tf/` (`demos/archive/2026/09/21/x.dem` or `demos/x.dem`).
+- Subcommand `play <id> [--tick N]` (id or archived filename; default tick = first event).
+- **Whether `+demo_gototick` at launch works is unverified** and verifying it
+  means launching TF2 = checkpoint §5.5. Build the clipboard fallback regardless
+  and ask the user to test the launch form once at the end (`~/.claude/skills/run-tf2/`
+  explains the desktop takeover).
+
+### Step 2 — `src/watch.rs` + `tf2demos watch`
+- Loop every `poll_secs` (new config key, default 5, add to `config.rs` and the
+  HM module): `tf2::is_running()`; on running → stopped, wait 5 s for ds to
+  flush `.json`, build the review queue (step 0), and if non-empty:
+  `notify-send -a tf2demos -t 0 -A default=Review "TF2 closed" "N demos, M marks to review"`.
+  If stdout is `default`, spawn `tf2demos review`. Nothing steals focus.
+- No file moves, no deletes, no `_events.txt` writes in the watcher.
+- Test the transition logic with an injected "is running" closure; do not
+  depend on TF2 for tests.
+
+### Step 3 — `tf2demos review`: egui/eframe wizard
+- Add `eframe`/`egui` (`--features wayland` on eframe/winit, X11 off). Nix:
+  devShell needs `pkg-config libxkbcommon wayland libGL vulkan-loader fontconfig`
+  and an `LD_LIBRARY_PATH`; the package needs `autoPatchelfHook` or a
+  `wrapProgram --prefix LD_LIBRARY_PATH` because winit/wgpu `dlopen` them.
+  Keep `nix flake check` headless: unit-test the queue/state machine, not the window.
+- `theme.toml` (`~/.config/tf2demos/theme.toml`, HM-generated, read-only): keys
+  `bg panel dim text cyan pink purple yellow green blue` from the HANDOFF §2
+  palette; `src/ui/theme.rs` maps them to egui `Visuals`. Default palette
+  compiled in so the app runs without the file.
+- Wizard per HANDOFF §4 Review wizard: one card per event; map, `mm:ss`
+  (`tick / 66.6667`), date, "N presses" if grouped; label buttons `1..9` from
+  `index.labels` + free-text box (free text → `Index::add_label`); class (`c`,
+  default `last_class`); rating (`r` then 1–5); **streak** (`s`? pick a key that
+  does not collide with Skip; integer, default 1); Play at tick (Enter/`p` → step 1);
+  Skip; Save & next. Esc leaves; progress saved per card via `Index::save`
+  (atomic) and `last_class` updated. A demo becomes `reviewed` when all its
+  events are labelled or skipped.
+- After every save: regenerate `by-label/` (reuse the archive.rs function; make
+  it public/callable without a full organize) so labelled links appear immediately.
+- Look: match the rice. Verify with `grim` after focusing via `niri msg` (see
+  `run-tf2` skill for the focus/screenshot pattern). Keep the T2 iGPU in mind:
+  no continuous `request_repaint`.
+
+### Step 4 — HM module additions
+- `services.tf2demos.watcher.enable` (default true when `enable`), generating
+  `systemd.user.services.tf2demos-watch`: `Type = "simple"`, `ExecStart = "<pkg> watch"`,
+  `Restart = "on-failure"`, `Install.WantedBy = [ "graphical-session.target" ]`,
+  `Unit.PartOf = [ "graphical-session.target" ]`. Verify with
+  `systemctl --user show-environment` that `WAYLAND_DISPLAY` and
+  `DBUS_SESSION_BUS_ADDRESS` reach the unit (HM's user services under a graphical
+  session normally inherit them); `notify-send` and `wl-copy` need them, and the
+  `review` GUI spawned from the watcher needs `WAYLAND_DISPLAY`.
+- `services.tf2demos.theme` (attrs of hex strings, defaults = palette) →
+  `xdg.configFile."tf2demos/theme.toml"`. `settings.poll_secs`.
+- `PATH` for the watch unit must include `libnotify`, `wl-clipboard`, and `steam`
+  (`/run/current-system/sw/bin` or `lib.makeBinPath`); the organize unit needs none.
+
+### Step 5 — prove it locally (§6 + §7 checklist) before any push or `/etc/nixos` change.
+
+### Step 6 — git: commit as work lands; **push is checkpoint §5.3**.
+
+### Step 7 — `/etc/nixos`: move the lock and `switch` (§2 Deployment; checkpoints §5.2, §5.4).
+No new files are needed there unless you add `services.tf2demos.theme` overrides.
+
+### Step 8 — first live watcher check: `systemctl --user status tf2demos-watch`,
+then ask the user to play one game and confirm the notification appears on exit.
 
 ---
 
-## 5. Safety rules (HANDOFF §6, amended)
+## 5. Hard checkpoints — stop and ask; everything else is autonomous **[user]**
+
+1. Any change to what `organize` **moves or deletes**, and the first run of a
+   changed `organize` without `--dry-run` on the real `tf/demos`.
+2. Any edit to a root-owned file in `/etc/nixos` (`flake.nix`, `configuration.nix`,
+   `flake.lock`), and any `sudo git -C /etc/nixos add` (the user runs it; give
+   the exact command with the `!` prefix so it runs in-session).
+3. `git push`.
+4. `nixos-rebuild switch` / the `switch` alias, including `--update-input` /
+   `--override-input` forms.
+5. Launching TF2 (`steam -applaunch 440`) for any reason, including verifying
+   `+demo_gototick`. Read `~/.claude/skills/run-tf2/SKILL.md` first.
+
+Design questions not on this list (step 0 included): decide, note the decision in
+your final message, keep going. The user has asked to be asked questions when a
+choice materially changes the work; batch them into one `AskUserQuestion` early.
+
+---
+
+## 6. Safety rules (cumulative)
 
 - Never delete a `.dem` that has a `.json` sidecar. Never touch a file newer than
-  `age_hours`. Never move or delete inside `archive/` except the regenerated
-  `by-label/` symlinks.
-- Never write `config.toml` (or the future `theme.toml`). Mutable state is
-  `index.json` only.
-- A move is complete only when the destination exists with the same size; only
-  then remove the source. Save the index after the moves, atomically.
-- **All development runs use a copy.** Make it once per session:
+  `age_hours` except to **read** it for review. Never move or delete inside
+  `archive/` except the regenerated `by-label/` symlinks.
+- Never write `config.toml` or `theme.toml`. Mutable state is `index.json` only,
+  written via `Index::save` (atomic rename).
+- **Labels are precious.** Any code path that writes `index.json` must load the
+  current file first and must not drop `label/class/rating/streak` set by another
+  path (`organize` runs at midnight while the user may be reviewing).
+- All development runs use a copy. Make it once per session:
   ```
-  cp -a "/home/brucking/.local/share/Steam/steamapps/common/Team Fortress 2/tf/demos" <scratchpad>/tf/demos
+  S=<your scratchpad>; mkdir -p $S/tf
+  cp -a "/home/brucking/.local/share/Steam/steamapps/common/Team Fortress 2/tf/demos" $S/tf/demos
   ```
-  and a scratch config with `tf_dir = "<scratchpad>/tf"` **and `age_hours = 0`**,
-  so every demo qualifies regardless of the date you run on (the expectations in
-  §6 assume that; the real config keeps 24). The real directory is ~117 MB
-  [verified]; the copy is cheap. Reset the copy with the same command.
-- `_events.txt` rewrite is the one TF2-aware step (§2); do not add other gates.
+  with a scratch config `tf_dir = "$S/tf"`, `age_hours = 0` for organize tests
+  (24 for rehearsing the real shape). The copy now includes `archive/` and
+  `index.json`, so review/watch tests have real archived entries to label.
+  `TF2DEMOS_TF2_RUNNING=0|1` overrides the process check for scratch runs.
+- The watcher must never call `organize`; the timer does that.
 
 ---
 
-## 6. Verification checklist (run all before saying done)
+## 7. Verification checklist (run all before saying done)
 
-- `nix develop -c cargo test` passes using the header fixtures (all six rows of
-  the step-2 table asserted exactly, plus grouping and in-progress cases).
-- `nix flake check` passes (tests + clippy clean).
-- `nix build .#default` yields `result/bin/tf2demos`; `result/bin/tf2demos --help`
-  lists `organize`.
-- `organize --dry-run --config <scratch>` on a fresh copy prints: 5 `MOVE` lines
-  with the new names (`2026-08-16_23-04-42_pl_pier.dem`,
-  `2026-09-09_22-09-51_pl_borneo.dem`, `2026-09-21_00-00-37_pl_phoenix.dem`,
-  `2026-09-21_19-51-20_pl_badwater.dem`, `Tight_scout_m_pl_badwater.dem`), the
-  correct day directories, one `SKIP too new` or `DELETE` for
-  `2026-09-21_20-42-43.dem` depending on its age at run time, `FOLD` lines for the
-  archived demos including the `Tight_scout_m` line matched via its original
-  name `2026-09-21_19-54-00`, and 2 `ORPHAN` lines. (If the real directory has
-  changed since 2026-09-21, adjust expectations from what is actually there.)
-- Real run on the copy, then a second run: the second run changes nothing.
-  `find <scratch>/tf/demos` shows the day tree, `events.txt` per day,
-  `events-orphans.txt`, `index.json`, and `by-label/unlabelled/` with 5 relative
-  symlinks that resolve (`find -L … -type l` prints nothing).
-- After `switch`: `systemctl --user list-timers | grep tf2demos-organize`;
-  `systemctl --user start tf2demos-organize` then
-  `journalctl --user -u tf2demos-organize -n 50`; `readlink ~/.config/tf2demos/config.toml`
-  points into `/nix/store`.
+- `nix develop -c cargo test`, `nix flake check` (tests + clippy clean, headless),
+  `nix build .#default` → `result/bin/tf2demos --help` lists `organize watch review play`.
+- Existing session-1 checks still hold on a fresh scratch copy: `organize --dry-run`
+  prints only `SKIP`/`LINK`/`DONE` on an organized tree; a real run twice changes
+  nothing; `find -L archive/by-label -type l` prints nothing.
+- Label round-trip on the scratch copy: label one archived event and one **hot**
+  demo's event via the wizard (or a test that drives the same code), `cat index.json`
+  shows them, `by-label/<label>/<date>_<map>_t<tick>_r<rating>.dem` exists and
+  resolves, `by-label/unlabelled/` no longer lists that demo. Then run `organize`
+  with `age_hours = 0`: the hot demo moves and **keeps its label**.
+- Watcher transition test: injected running→stopped produces one notification
+  call with the right counts; stopped→stopped produces none.
+- Manual `notify-send -a tf2demos -t 0 -A default=Review "test" "body"` shows in
+  mako and prints `default` when clicked [assumed; verify].
+- GUI screenshot via `grim` shows the palette (bg `#120B10`, cyan `#00FFC8`, pink `#FF0055`).
+- After `switch`: `systemctl --user status tf2demos-watch` active,
+  `systemctl --user list-timers | grep tf2demos-organize` still present,
+  `readlink ~/.config/tf2demos/theme.toml` points into `/nix/store`,
+  `journalctl --user -u tf2demos-organize -n 20` shows the last nightly run clean.
 
 ---
 
-## 7. Deferred — do not build this session
+## 8. Deferred — do not build this session
 
-GUI (egui/eframe, `theme.toml`, palette in HANDOFF §2), review wizard, TF2-exit
-watcher + mako notification, `play` / clipboard helper, freeze/thaw cold store,
-labelled symlink names with tick and rating (needs labels, but the naming
-function exists from step 4 so the tree regenerates correctly later). When these
-come, HANDOFF §3–§5 still describe them, with the §2 corrections above.
+Events/Demos tabs + timeline widget (`tf2demos gui`), search/filter bar,
+freeze/thaw cold store (nested zip, one sub-zip per calendar day, `~/Archive/tf2-demos/`),
+`search`/`index` subcommands. HANDOFF §3–§5 still describe them, with the §3
+corrections above.
 
 ---
 
-## 8. Pointers
+## 9. Pointers
 
-- `HANDOFF.md` §2 file formats, §4 index/config schema, Appendix A verbatim user answers.
-- `/etc/nixos/home/modules/terminal/ai/claude_code.nix` lines 221–250: user timer pattern.
-- `/etc/nixos/home/modules/wm/niri.nix`: `rustPlatform` usage in this config.
-- `/etc/nixos/home/modules/default.nix`: HM module import list.
-- `~/.dots/sync-nixos.sh`: mirrors `/etc/nixos` to GitHub after changes.
-- `~/.claude/skills/run-tf2/`: TF2 launch driver (later sessions only).
-- `/etc/nixos/home/themes/discordo/cyberpunk.toml`: palette for the GUI session.
+- `HANDOFF.md` §2 file formats + palette, §4 index/config/wizard/playback, Appendix A verbatim user answers.
+- `src/archive.rs` `organize_with()` and `plan_fold()`: the only code that moves files; `by_label_links()` for step 3.
+- `nix/hm-module.nix`: extend, keep `settings` freeform; `/etc/nixos/home/modules/terminal/ai/claude_code.nix` lines 221–250 for the unit pattern.
+- `/etc/nixos/home/modules/notifications/mako.nix`: `default-timeout = 5000`.
+- `/etc/nixos/home/modules/wm/niri.nix`: `rustPlatform` usage; `home/themes/discordo/cyberpunk.toml`, `home/config/waybar/colors/colors.css`: palette sources.
+- `~/.claude/skills/run-tf2/`: launch/focus/screenshot driver (checkpoint §5.5).
+- `~/.dots/sync-nixos.sh`: mirror `/etc/nixos` after changes.
+- Memory dir `~/.claude/projects/-home-brucking-Projects-tf2demos/memory/`: `pgrep-self-match.md`, `session1-state.md`.
