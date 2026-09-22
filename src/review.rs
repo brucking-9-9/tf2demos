@@ -6,7 +6,7 @@
 //! [`Session::apply`], which **reloads `index.json` first** and patches one event: the nightly
 //! `organize` may rewrite the file while the wizard is open, and nothing here may undo that.
 //!
-//! Queue = every event with `label == null` in demos with `reviewed == false`, oldest first.
+//! Queue = every event with no labels in demos with `reviewed == false`, oldest first.
 //! *Skip* leaves the event unlabelled; a demo becomes `reviewed` once each of its events is
 //! labelled or was skipped in this session, so skipped marks do not come back on the next run.
 
@@ -20,7 +20,7 @@ use chrono::NaiveDateTime;
 use crate::archive;
 use crate::config::Config;
 use crate::demo::{self, Header, Sidecar};
-use crate::index::{DemoEntry, Index, State};
+use crate::index::{DemoEntry, Event, Index, State};
 
 /// One card of the wizard: an unlabelled event plus what the card shows about its demo.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +50,8 @@ pub fn format_offset(tick: i64) -> String {
 /// What one card's answer looks like.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Answer {
-    pub label: String,
+    /// One or more tags; blanks are dropped, duplicates collapse.
+    pub labels: Vec<String>,
     pub class: Option<String>,
     pub rating: Option<u8>,
     /// Blank in the wizard → 1.
@@ -67,12 +68,17 @@ pub fn mark_time(recorded_at: NaiveDateTime, tick: i64) -> NaiveDateTime {
 /// alone; inner `None` = clear.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EventPatch {
-    pub label: Option<Option<String>>,
+    /// Replace the tag set (`Some(vec![])` clears it).
+    pub labels: Option<Vec<String>>,
+    /// Tags to add / remove after `labels` is applied.
+    pub add_labels: Vec<String>,
+    pub remove_labels: Vec<String>,
     pub class: Option<Option<String>>,
     pub rating: Option<Option<u8>>,
     pub streak: Option<Option<u32>>,
     /// Force the demo's `reviewed` flag (`Some(false)` puts its unlabelled marks back in the
-    /// wizard's queue). Otherwise it flips to `true` once every event is labelled.
+    /// wizard's queue). Otherwise it flips to `true` once every event is labelled, and back to
+    /// `false` when this edit removes the mark's last tag.
     pub reviewed: Option<bool>,
 }
 
@@ -127,15 +133,20 @@ pub fn edit_event(
         },
     };
     let ev = &mut entry.events[pos];
-    if let Some(label) = &patch.label {
-        ev.label = label
-            .as_deref()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from);
-        if ev.label.is_some() && ev.streak.is_none() {
-            ev.streak = Some(1);
+    let was_labelled = ev.is_labelled();
+    if let Some(labels) = &patch.labels {
+        ev.labels.clear();
+        for l in labels {
+            ev.add_label(l.trim());
         }
+    }
+    for l in &patch.add_labels {
+        ev.add_label(l.trim());
+    }
+    ev.labels
+        .retain(|l| !l.is_empty() && !patch.remove_labels.iter().any(|r| r.trim() == l));
+    if ev.is_labelled() && ev.streak.is_none() {
+        ev.streak = Some(1);
     }
     if let Some(class) = &patch.class {
         ev.class = class
@@ -150,14 +161,19 @@ pub fn edit_event(
     if let Some(streak) = patch.streak {
         ev.streak = streak.map(|n| n.max(1));
     }
-    let new_label = ev.label.clone();
+    let new_labels = ev.labels.clone();
     let new_class = ev.class.clone();
+    let unlabelled_now = was_labelled && !ev.is_labelled();
     entry.reviewed = match patch.reviewed {
         Some(r) => r,
-        None => entry.reviewed || entry.events.iter().all(|e| e.label.is_some()),
+        // Taking the last tag off a mark sends it back to the wizard; otherwise a demo stays
+        // reviewed (a skip is not undone by editing a sibling mark) or becomes reviewed once
+        // every mark carries a tag.
+        None if unlabelled_now => false,
+        None => entry.reviewed || entry.events.iter().all(Event::is_labelled),
     };
     let result = entry.clone();
-    if let Some(l) = &new_label {
+    for l in &new_labels {
         ix.add_label(l);
     }
     if patch.class.is_some() && new_class.is_some() {
@@ -255,7 +271,7 @@ pub fn queue(index: &Index) -> Vec<Card> {
         .flat_map(|d| {
             d.events
                 .iter()
-                .filter(|e| e.label.is_none())
+                .filter(|e| !e.is_labelled())
                 .map(move |e| Card {
                     demo_id: d.id.clone(),
                     tick: e.tick,
@@ -343,20 +359,28 @@ impl Session {
         let Some(card) = self.current().cloned() else {
             bail!("review: nothing left to label");
         };
-        let label = answer.label.trim().to_string();
-        if label.is_empty() {
-            bail!("review: label is empty");
+        let mut labels: Vec<String> = Vec::new();
+        for l in &answer.labels {
+            let l = l.trim();
+            if !l.is_empty() && !labels.iter().any(|x| x == l) {
+                labels.push(l.to_string());
+            }
+        }
+        if labels.is_empty() {
+            bail!("review: no label given");
         }
         let class = answer
             .class
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty());
         self.patch(&card, |ix, ev| {
-            ev.label = Some(label.clone());
+            ev.labels = labels.clone();
             ev.class = class.clone();
             ev.rating = answer.rating.map(|r| r.clamp(1, 5));
             ev.streak = Some(answer.streak.max(1));
-            ix.add_label(&label);
+            for l in &labels {
+                ix.add_label(l);
+            }
             if class.is_some() {
                 ix.last_class = class.clone();
             }
@@ -417,7 +441,7 @@ impl Session {
             entry.reviewed = entry
                 .events
                 .iter()
-                .all(|e| e.label.is_some() || skipped.contains(&(entry.id.clone(), e.tick)));
+                .all(|e| e.is_labelled() || skipped.contains(&(entry.id.clone(), e.tick)));
         }
         ix.save(&path)?;
         archive::rebuild_by_label(&self.cfg, &ix)?;
@@ -467,7 +491,7 @@ mod tests {
             tick,
             presses: 1,
             raw_ticks: vec![tick],
-            label: label.map(str::to_string),
+            labels: label.map(str::to_string).into_iter().collect(),
             class: None,
             rating: None,
             streak: None,
@@ -568,7 +592,7 @@ mod tests {
             "2026-09-21_19-51-20",
             None,
             &EventPatch {
-                label: Some(Some(" c-tap ".into())),
+                labels: Some(vec![" c-tap ".into(), "".into(), "c-tap".into()]),
                 class: Some(Some("scout".into())),
                 rating: Some(Some(9)),
                 ..EventPatch::default()
@@ -576,7 +600,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.file, "demos/2026-09-21_19-51-20.dem");
-        assert_eq!(e.events[0].label.as_deref(), Some("c-tap"));
+        assert_eq!(e.events[0].labels, ["c-tap"]);
         assert_eq!(e.events[0].class.as_deref(), Some("scout"));
         assert_eq!(e.events[0].rating, Some(5));
         assert_eq!(e.events[0].streak, Some(1), "label without streak → 1");
@@ -595,7 +619,8 @@ mod tests {
             "2026-08-16_23-04-42_pl_pier.dem",
             Some(24405),
             &EventPatch {
-                label: Some(Some("matador".into())),
+                labels: Some(vec!["matador".into()]),
+                add_labels: vec!["surf stab".into()],
                 streak: Some(Some(0)),
                 reviewed: Some(false),
                 ..EventPatch::default()
@@ -603,21 +628,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.id, "2026-08-16_23-04-42");
-        assert_eq!(e.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(e.events[0].labels, ["matador", "surf stab"]);
         assert_eq!(e.events[0].streak, Some(1));
-        assert!(!e.reviewed);
+        assert!(!e.reviewed, "--requeue wins over the all-labelled rule");
+        assert!(
+            t.root
+                .join("tf/demos/archive/by-label/surf stab/2026-08-16_pl_pier_t24405_r0.dem")
+                .exists()
+        );
+        // Remove one tag; the other stays and its link is regenerated; still labelled → reviewed.
+        let e = edit_event(
+            &t.cfg,
+            "2026-08-16_23-04-42",
+            None,
+            &EventPatch {
+                remove_labels: vec!["matador".into()],
+                ..EventPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.events[0].labels, ["surf stab"]);
+        assert!(!t.root.join("tf/demos/archive/by-label/matador").exists());
+        assert!(e.reviewed);
         // Clearing the label puts it back into the queue and the unlabelled link returns.
         let e = edit_event(
             &t.cfg,
             "2026-08-16_23-04-42",
             None,
             &EventPatch {
-                label: Some(None),
+                labels: Some(vec![]),
                 ..EventPatch::default()
             },
         )
         .unwrap();
-        assert_eq!(e.events[0].label, None);
+        assert!(e.events[0].labels.is_empty());
         let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
         let q = queue(&ix);
         assert!(q.iter().any(|c| c.demo_id == "2026-08-16_23-04-42"));
@@ -626,7 +670,7 @@ mod tests {
                 .join("tf/demos/archive/by-label/unlabelled/2026-08-16_23-04-42_pl_pier.dem")
                 .exists()
         );
-        assert!(!t.root.join("tf/demos/archive/by-label/matador").exists());
+        assert!(!t.root.join("tf/demos/archive/by-label/surf stab").exists());
         assert_eq!(
             ix.labels.len(),
             3,
@@ -744,7 +788,7 @@ mod tests {
         other.save(&t.cfg.index_path()).unwrap();
 
         s.save(Answer {
-            label: "  free text ".into(),
+            labels: vec!["  free text ".into(), "matador".into(), "free text".into()],
             class: Some("spy".into()),
             rating: Some(7),
             streak: 0,
@@ -752,7 +796,7 @@ mod tests {
         .unwrap();
         let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
         let pier = ix.by_id("2026-08-16_23-04-42").unwrap();
-        assert_eq!(pier.events[0].label.as_deref(), Some("free text"));
+        assert_eq!(pier.events[0].labels, ["free text", "matador"]);
         assert_eq!(pier.events[0].class.as_deref(), Some("spy"));
         assert_eq!(pier.events[0].rating, Some(5), "clamped");
         assert_eq!(pier.events[0].streak, Some(1), "blank streak → 1");
@@ -782,7 +826,7 @@ mod tests {
         let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
         let ph = ix.by_id("2026-09-21_00-00-37").unwrap();
         assert!(ph.reviewed);
-        assert_eq!(ph.events[0].label, None);
+        assert!(ph.events[0].labels.is_empty());
 
         // Label the hot badwater demo; the link points into tf/demos.
         assert_eq!(s.current().unwrap().demo_id, "2026-09-21_19-51-20");
@@ -791,7 +835,7 @@ mod tests {
             Some("demos/2026-09-21_19-51-20.dem")
         );
         s.save(Answer {
-            label: "matador".into(),
+            labels: vec!["matador".into()],
             class: None,
             rating: Some(4),
             streak: 3,
@@ -802,7 +846,7 @@ mod tests {
         assert!(s.current().is_none());
         assert!(
             s.save(Answer {
-                label: "x".into(),
+                labels: vec!["x".into()],
                 class: None,
                 rating: None,
                 streak: 1,
@@ -811,7 +855,7 @@ mod tests {
         );
         let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
         let bad = ix.by_id("2026-09-21_19-51-20").unwrap();
-        assert_eq!(bad.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(bad.events[0].labels, ["matador"]);
         assert_eq!(bad.events[0].streak, Some(3));
         assert_eq!(
             ix.last_class.as_deref(),
@@ -859,7 +903,7 @@ mod tests {
             bad.file,
             "demos/archive/2026/09/21/2026-09-21_19-51-20_pl_badwater.dem"
         );
-        assert_eq!(bad.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(bad.events[0].labels, ["matador"]);
         assert_eq!(bad.events[0].rating, Some(4));
         assert!(bad.reviewed);
         assert!(ix.by_id("2026-09-21_00-00-37").unwrap().reviewed);

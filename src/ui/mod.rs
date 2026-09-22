@@ -52,7 +52,8 @@ pub fn run_review(cfg: &Config, theme: &Theme) -> Result<()> {
 /// What the user has entered for the current card.
 #[derive(Debug, Clone, Default)]
 struct Draft {
-    label: Option<String>,
+    /// Tags picked so far (pills toggle; free text adds).
+    labels: Vec<String>,
     free_text: String,
     class: Option<String>,
     rating: Option<u8>,
@@ -123,11 +124,25 @@ impl ReviewApp {
         self.draft.class = Some(classes[next].clone());
     }
 
+    /// Toggle the `n`-th label of the list on the draft.
     fn pick_label(&mut self, n: usize) {
-        if let Some(l) = self.session.labels().get(n) {
-            self.draft.label = Some(l.clone());
-            self.info(format!("label: {l}"));
+        if let Some(l) = self.session.labels().get(n).cloned() {
+            self.toggle_label(&l);
         }
+    }
+
+    fn toggle_label(&mut self, label: &str) {
+        if let Some(i) = self.draft.labels.iter().position(|x| x == label) {
+            self.draft.labels.remove(i);
+        } else {
+            self.draft.labels.push(label.to_string());
+        }
+        let text = self.draft.labels.join(", ");
+        self.info(if text.is_empty() {
+            "no label".to_string()
+        } else {
+            format!("labels: {text}")
+        });
     }
 
     fn play(&mut self) {
@@ -146,10 +161,10 @@ impl ReviewApp {
     }
 
     fn save(&mut self) {
-        let Some(label) = self.draft.label.clone() else {
-            self.error("pick a label first (1–9, or t to type one)");
+        if self.draft.labels.is_empty() {
+            self.error("pick at least one label (1–9 toggle, or t to type one)");
             return;
-        };
+        }
         let streak = match self.draft.streak.trim() {
             "" => 1,
             s => match s.parse::<u32>() {
@@ -161,7 +176,7 @@ impl ReviewApp {
             },
         };
         let answer = Answer {
-            label,
+            labels: self.draft.labels.clone(),
             class: self.draft.class.clone(),
             rating: self.draft.rating,
             streak,
@@ -253,7 +268,7 @@ impl ReviewApp {
         } else if pressed(Key::S) {
             self.skip();
         } else if pressed(Key::Enter) {
-            if self.draft.label.is_some() {
+            if !self.draft.labels.is_empty() {
                 self.save();
             } else {
                 self.play();
@@ -320,18 +335,18 @@ impl ReviewApp {
 
     fn card_body(&mut self, ui: &mut egui::Ui) {
         // Label.
-        self.section(ui, "label", "1–9, or t to type");
+        self.section(ui, "labels", "1–9 toggle (pick several), or t to type");
         let labels: Vec<String> = self.session.labels().to_vec();
         ui.horizontal_wrapped(|ui| {
             for (i, l) in labels.iter().enumerate() {
-                let selected = self.draft.label.as_deref() == Some(l.as_str());
+                let selected = self.draft.labels.iter().any(|x| x == l);
                 let text = if i < 9 {
                     format!("{} {l}", i + 1)
                 } else {
                     l.clone()
                 };
                 if self.pill(ui, text, selected).clicked() {
-                    self.draft.label = Some(l.clone());
+                    self.toggle_label(l);
                 }
             }
         });
@@ -345,12 +360,20 @@ impl ReviewApp {
                 self.focus_free_text = false;
             }
             let committed = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if (committed || ui.button("use").clicked()) && !self.draft.free_text.trim().is_empty()
+            if (committed || ui.button("add").clicked()) && !self.draft.free_text.trim().is_empty()
             {
-                self.draft.label = Some(self.draft.free_text.trim().to_string());
+                let l = self.draft.free_text.trim().to_string();
+                if !self.draft.labels.contains(&l) {
+                    self.draft.labels.push(l);
+                }
+                self.draft.free_text.clear();
             }
-            if let Some(l) = &self.draft.label {
-                ui.label(RichText::new(format!("→ {l}")).color(self.p.cyan).strong());
+            if !self.draft.labels.is_empty() {
+                ui.label(
+                    RichText::new(format!("→ {}", self.draft.labels.join(", ")))
+                        .color(self.p.cyan)
+                        .strong(),
+                );
             }
         });
 
@@ -422,7 +445,7 @@ impl ReviewApp {
                     .color(self.p.bg)
                     .strong(),
             )
-            .fill(if self.draft.label.is_some() {
+            .fill(if !self.draft.labels.is_empty() {
                 self.p.green
             } else {
                 self.p.dim

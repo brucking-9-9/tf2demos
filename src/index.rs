@@ -76,11 +76,53 @@ pub struct Event {
     pub tick: i64,
     pub presses: u32,
     pub raw_ticks: Vec<i64>,
-    pub label: Option<String>,
+    /// Tags of the play (any number). Files written before tags existed carry a single
+    /// `label` (string or null); both forms parse, and `labels` is what gets written.
+    #[serde(default, alias = "label", deserialize_with = "one_or_many")]
+    pub labels: Vec<String>,
     pub class: Option<String>,
     pub rating: Option<u8>,
     /// Kill streak / combo length of the play. Default `1` when labelled.
     pub streak: Option<u32>,
+}
+
+impl Event {
+    pub fn is_labelled(&self) -> bool {
+        !self.labels.is_empty()
+    }
+
+    /// `"-"` when unlabelled, else the tags joined with `sep`.
+    pub fn labels_text(&self, sep: &str) -> String {
+        if self.labels.is_empty() {
+            "-".to_string()
+        } else {
+            self.labels.join(sep)
+        }
+    }
+
+    /// Append `label` unless already present (case-sensitive). Returns whether it was added.
+    pub fn add_label(&mut self, label: &str) -> bool {
+        if self.labels.iter().any(|l| l == label) {
+            return false;
+        }
+        self.labels.push(label.to_string());
+        true
+    }
+}
+
+/// `null` → `[]`, `"x"` → `["x"]`, `["x", "y"]` → as is.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        One(Option<String>),
+        Many(Vec<String>),
+    }
+    Ok(match Raw::deserialize(d)? {
+        Raw::One(None) => Vec::new(),
+        Raw::One(Some(s)) => vec![s],
+        Raw::Many(v) => v,
+    })
 }
 
 /// Read just enough to reject foreign schemas before the full parse.
@@ -225,7 +267,7 @@ impl Index {
                         });
                     if let Some(i) = hit {
                         let o = &old.events[i];
-                        ev.label = o.label.clone();
+                        ev.labels = o.labels.clone();
                         ev.class = o.class.clone();
                         ev.rating = o.rating;
                         ev.streak = o.streak;
@@ -234,7 +276,7 @@ impl Index {
                 }
                 // A labelled event that the fresh sidecar no longer lists is kept rather than lost.
                 for (o, used) in old.events.into_iter().zip(used) {
-                    if !used && o.label.is_some() {
+                    if !used && o.is_labelled() {
                         new.events.push(o);
                     }
                 }
@@ -248,7 +290,7 @@ impl Index {
     /// Positions of the entries that still hold labels somewhere.
     #[allow(dead_code)]
     pub fn has_labels(entry: &DemoEntry) -> bool {
-        entry.events.iter().any(|e| e.label.is_some())
+        entry.events.iter().any(Event::is_labelled)
     }
 
     /// Add a label unless an identical (case-sensitive) one exists. Returns whether it was added.
@@ -304,7 +346,7 @@ mod tests {
                 tick: 6964,
                 presses: 1,
                 raw_ticks: vec![6964],
-                label: Some("matador".into()),
+                labels: vec!["matador".into()],
                 class: Some("spy".into()),
                 rating: Some(4),
                 streak: Some(1),
@@ -335,7 +377,7 @@ mod tests {
     "reviewed": true,
     "events": [{
       "tick": 6964, "presses": 1, "raw_ticks": [6964],
-      "label": "matador", "class": "spy", "rating": 4, "streak": 1
+      "labels": ["matador"], "class": "spy", "rating": 4, "streak": 1
     }]
   }],
   "labels": ["surf stab", "c-tap", "matador"],
@@ -357,6 +399,50 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&seeded()).unwrap()).unwrap();
         let expected: serde_json::Value = serde_json::from_str(HANDOFF_JSON).unwrap();
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn single_label_files_still_parse() {
+        let old = HANDOFF_JSON.replace(r#""labels": ["matador"]"#, r#""label": "matador""#);
+        assert_ne!(old, HANDOFF_JSON);
+        assert_eq!(Index::parse(&old).unwrap(), seeded());
+        let none = HANDOFF_JSON.replace(r#""labels": ["matador"]"#, r#""label": null"#);
+        assert!(
+            Index::parse(&none).unwrap().demos[0].events[0]
+                .labels
+                .is_empty()
+        );
+        let many = HANDOFF_JSON.replace(r#""labels": ["matador"]"#, r#""labels": ["a", "b"]"#);
+        assert_eq!(
+            Index::parse(&many).unwrap().demos[0].events[0].labels,
+            ["a", "b"]
+        );
+        let missing = HANDOFF_JSON.replace(r#""labels": ["matador"], "#, "");
+        assert!(
+            Index::parse(&missing).unwrap().demos[0].events[0]
+                .labels
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn event_label_helpers() {
+        let mut e = Event {
+            tick: 1,
+            presses: 1,
+            raw_ticks: vec![1],
+            labels: vec![],
+            class: None,
+            rating: None,
+            streak: None,
+        };
+        assert!(!e.is_labelled());
+        assert_eq!(e.labels_text(", "), "-");
+        assert!(e.add_label("a"));
+        assert!(!e.add_label("a"));
+        assert!(e.add_label("b"));
+        assert_eq!(e.labels_text(", "), "a, b");
+        assert!(e.is_labelled());
     }
 
     #[test]
@@ -382,15 +468,16 @@ mod tests {
             tick: 1,
             presses: 1,
             raw_ticks: vec![1],
-            label: None,
+            labels: vec![],
             class: None,
             rating: None,
             streak: None,
         };
         let v = serde_json::to_value(e).unwrap();
-        for key in ["label", "class", "rating", "streak"] {
+        for key in ["class", "rating", "streak"] {
             assert!(v[key].is_null(), "{key} must be present as null");
         }
+        assert_eq!(v["labels"], serde_json::json!([]));
     }
 
     #[test]
@@ -483,7 +570,7 @@ mod tests {
             tick: 9000,
             presses: 1,
             raw_ticks: vec![9000],
-            label: None,
+            labels: vec![],
             class: None,
             rating: None,
             streak: None,
@@ -499,7 +586,7 @@ mod tests {
                 tick: 6964,
                 presses: 1,
                 raw_ticks: vec![6964],
-                label: None,
+                labels: vec![],
                 class: None,
                 rating: None,
                 streak: None,
@@ -508,7 +595,7 @@ mod tests {
                 tick: 9000,
                 presses: 1,
                 raw_ticks: vec![9000],
-                label: None,
+                labels: vec![],
                 class: None,
                 rating: None,
                 streak: None,
@@ -545,11 +632,11 @@ mod tests {
         );
         assert!(d.reviewed, "reviewed kept");
         assert_eq!(d.events.len(), 2);
-        assert_eq!(d.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(d.events[0].labels, ["matador"]);
         assert_eq!(d.events[0].class.as_deref(), Some("spy"));
         assert_eq!(d.events[0].rating, Some(4));
         assert_eq!(d.events[0].streak, Some(1));
-        assert_eq!(d.events[1].label, None);
+        assert!(d.events[1].labels.is_empty());
     }
 
     #[test]
@@ -563,7 +650,7 @@ mod tests {
             tick: 12000,
             presses: 1,
             raw_ticks: vec![12000],
-            label: Some("c-tap".into()),
+            labels: vec!["c-tap".into()],
             class: None,
             rating: None,
             streak: None,
@@ -573,8 +660,8 @@ mod tests {
         let d = &ix.demos[0];
         let ticks: Vec<i64> = d.events.iter().map(|e| e.tick).collect();
         assert_eq!(ticks, [6964, 9000, 12000]);
-        assert_eq!(d.events[0].label.as_deref(), Some("matador"));
-        assert_eq!(d.events[2].label.as_deref(), Some("c-tap"));
+        assert_eq!(d.events[0].labels, ["matador"]);
+        assert_eq!(d.events[2].labels, ["c-tap"]);
     }
 
     #[test]
@@ -593,7 +680,7 @@ mod tests {
         ix.merge_archived(fresh, &["2026-09-21_19-51-20".to_string()]);
         assert_eq!(ix.demos.len(), 1);
         assert_eq!(ix.demos[0].id, "Tight_scout_m");
-        assert_eq!(ix.demos[0].events[0].label.as_deref(), Some("matador"));
+        assert_eq!(ix.demos[0].events[0].labels, ["matador"]);
         assert!(ix.by_id("2026-09-21_19-51-20").is_none());
     }
 

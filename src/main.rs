@@ -55,10 +55,16 @@ enum Command {
         /// Tick of the mark (any tick of a grouped press works). Optional when the demo has one mark.
         #[arg(long)]
         tick: Option<i64>,
-        /// New label (free text; added to the label list).
+        /// Set the tags (repeat for several; replaces the current set; new ones join the list).
         #[arg(long, conflicts_with = "clear_label")]
-        label: Option<String>,
-        /// Remove the label; the mark returns to the review queue.
+        label: Vec<String>,
+        /// Add a tag, keeping the existing ones (repeatable).
+        #[arg(long)]
+        add_label: Vec<String>,
+        /// Remove one tag (repeatable).
+        #[arg(long)]
+        remove_label: Vec<String>,
+        /// Remove every tag; the mark returns to the review queue.
         #[arg(long)]
         clear_label: bool,
         /// Your class (scout, soldier, ...).
@@ -108,6 +114,8 @@ fn main() -> Result<()> {
             id,
             tick,
             label,
+            add_label,
+            remove_label,
             clear_label,
             class,
             clear_class,
@@ -118,11 +126,15 @@ fn main() -> Result<()> {
             reviewed,
         } => {
             let patch = review::EventPatch {
-                label: if clear_label {
-                    Some(None)
+                labels: if clear_label {
+                    Some(Vec::new())
+                } else if label.is_empty() {
+                    None
                 } else {
-                    label.map(Some)
+                    Some(label)
                 },
+                add_labels: add_label,
+                remove_labels: remove_label,
                 class: if clear_class {
                     Some(None)
                 } else {
@@ -144,7 +156,7 @@ fn main() -> Result<()> {
             };
             if patch == review::EventPatch::default() {
                 bail!(
-                    "nothing to change: pass --label/--class/--rating/--streak, --clear-*, --requeue, or --reviewed"
+                    "nothing to change: pass --label/--add-label/--remove-label/--class/--rating/--streak, --clear-*, --requeue, or --reviewed"
                 );
             }
             let entry = review::edit_event(&cfg, &id, tick, &patch)?;
@@ -179,7 +191,7 @@ fn events(cfg: &config::Config, unlabelled: bool, demo: Option<&str>) -> Result<
             continue;
         }
         for ev in &d.events {
-            if unlabelled && ev.label.is_some() {
+            if unlabelled && ev.is_labelled() {
                 continue;
             }
             print_event(cfg, d, ev);
@@ -224,7 +236,7 @@ fn print_event(cfg: &config::Config, d: &index::DemoEntry, ev: &index::Event) {
         review::format_offset(ev.tick),
         review::mark_time(d.recorded_at, ev.tick).format("%H:%M:%S"),
         ev.presses,
-        ev.label.as_deref().unwrap_or("-"),
+        ev.labels_text(","),
         ev.class.as_deref().unwrap_or("-"),
         ev.rating.map_or("-".to_string(), |r| r.to_string()),
         ev.streak.map_or("-".to_string(), |s| s.to_string()),

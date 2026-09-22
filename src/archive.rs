@@ -393,7 +393,7 @@ fn process_demo(
                 "{new_name}  tick={} presses={} label={} class={} rating={} streak={}",
                 e.tick,
                 e.presses,
-                e.label.as_deref().unwrap_or("-"),
+                e.labels_text(","),
                 e.class.as_deref().unwrap_or("-"),
                 e.rating.map_or("-".to_string(), |r| r.to_string()),
                 e.streak.map_or("-".to_string(), |s| s.to_string()),
@@ -415,7 +415,7 @@ pub fn events_from_sidecar(sidecar: &Sidecar, group_secs: f64) -> Vec<Event> {
             tick: g.tick,
             presses: g.presses,
             raw_ticks: g.raw_ticks,
-            label: None,
+            labels: vec![],
             class: None,
             rating: None,
             streak: None,
@@ -732,10 +732,10 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 
 /// `(label directory, link file name)` for one link of `entry`.
 ///
-/// Unlabelled (`event == None`): `("unlabelled", "<archived stem>.dem")`. A labelled event:
+/// Unlabelled (`None`): `("unlabelled", "<archived stem>.dem")`. One tag of an event:
 /// `(<label>, "<YYYY-MM-DD>_<map>_t<tick>_r<rating or 0>.dem")`.
-pub fn by_label_link_name(entry: &DemoEntry, event: Option<&Event>) -> (String, String) {
-    match event.and_then(|e| e.label.as_deref().map(|l| (l, e))) {
+pub fn by_label_link_name(entry: &DemoEntry, tagged: Option<(&str, &Event)>) -> (String, String) {
+    match tagged {
         Some((label, e)) => (
             label.to_string(),
             format!(
@@ -756,13 +756,16 @@ pub fn by_label_link_name(entry: &DemoEntry, event: Option<&Event>) -> (String, 
     }
 }
 
-/// Every link `entry` gets: one per labelled event, or a single unlabelled one.
+/// Every link `entry` gets: one per tag of every labelled event, or a single unlabelled one.
 pub fn by_label_links(entry: &DemoEntry) -> Vec<(String, String)> {
     let labelled: Vec<(String, String)> = entry
         .events
         .iter()
-        .filter(|e| e.label.is_some())
-        .map(|e| by_label_link_name(entry, Some(e)))
+        .flat_map(|e| {
+            e.labels
+                .iter()
+                .map(move |l| by_label_link_name(entry, Some((l, e))))
+        })
         .collect();
     if labelled.is_empty() {
         vec![by_label_link_name(entry, None)]
@@ -889,7 +892,7 @@ mod tests {
             tick,
             presses: raw.len() as u32,
             raw_ticks: raw.to_vec(),
-            label: label.map(str::to_string),
+            labels: label.map(str::to_string).into_iter().collect(),
             class: None,
             rating,
             streak: None,
@@ -1019,7 +1022,7 @@ mod tests {
         );
         let labelled = event(6964, &[6964], Some("matador"), Some(4));
         assert_eq!(
-            by_label_link_name(&e, Some(&labelled)),
+            by_label_link_name(&e, Some(("matador", &labelled))),
             (
                 "matador".to_string(),
                 "2026-09-21_pl_badwater_t6964_r4.dem".to_string()
@@ -1027,15 +1030,13 @@ mod tests {
         );
         let unrated = event(10, &[10], Some("surf stab"), None);
         assert_eq!(
-            by_label_link_name(&e, Some(&unrated)),
+            by_label_link_name(&e, Some(("surf stab", &unrated))),
             (
                 "surf stab".to_string(),
                 "2026-09-21_pl_badwater_t10_r0.dem".to_string()
             )
         );
-        // An event without a label counts as unlabelled.
-        let plain = event(1, &[1], None, Some(3));
-        assert_eq!(by_label_link_name(&e, Some(&plain)).0, "unlabelled");
+        assert_eq!(by_label_link_name(&e, None).0, "unlabelled");
     }
 
     #[test]
@@ -1053,17 +1054,21 @@ mod tests {
                 "Tight_scout_m_pl_badwater.dem".to_string()
             )]
         );
+        let mut two_tags = event(10, &[10], Some("c-tap"), Some(2));
+        two_tags.labels.push("surf stab".into());
         e.events = vec![
-            event(10, &[10], Some("c-tap"), Some(2)),
+            two_tags,
             event(20, &[20], None, None),
             event(30, &[30], Some("matador"), None),
         ];
         let links = by_label_links(&e);
-        assert_eq!(links.len(), 2);
+        assert_eq!(links.len(), 3, "one link per tag: {links:?}");
         assert_eq!(links[0].0, "c-tap");
         assert_eq!(links[0].1, "2026-09-21_pl_badwater_t10_r2.dem");
-        assert_eq!(links[1].0, "matador");
-        assert_eq!(links[1].1, "2026-09-21_pl_badwater_t30_r0.dem");
+        assert_eq!(links[1].0, "surf stab");
+        assert_eq!(links[1].1, "2026-09-21_pl_badwater_t10_r2.dem");
+        assert_eq!(links[2].0, "matador");
+        assert_eq!(links[2].1, "2026-09-21_pl_badwater_t30_r0.dem");
     }
 
     #[test]
@@ -1714,7 +1719,7 @@ what is this
             "demos/archive/2026/09/21/2026-09-21_19-51-20_pl_badwater.dem"
         );
         assert!(bad.reviewed);
-        assert_eq!(bad.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(bad.events[0].labels, ["matador"]);
         assert_eq!(bad.events[0].class.as_deref(), Some("spy"));
         assert_eq!(bad.events[0].rating, Some(4));
         assert_eq!(bad.events[0].streak, Some(2));
@@ -1723,7 +1728,7 @@ what is this
             tight.file,
             "demos/archive/2026/09/21/Tight_scout_m_pl_badwater.dem"
         );
-        assert_eq!(tight.events[0].label.as_deref(), Some("surf stab"));
+        assert_eq!(tight.events[0].labels, ["surf stab"]);
         assert!(!tight.reviewed);
         assert_eq!(ix.labels.last().map(String::as_str), Some("free text"));
         assert_eq!(ix.last_class.as_deref(), Some("spy"));
@@ -1780,7 +1785,7 @@ what is this
         // Meanwhile the wizard labelled X, added a fresh hot demo N and a free-text label.
         let mut disk = loaded.clone();
         let dx = disk.by_id_mut("X").unwrap();
-        dx.events[0].label = Some("matador".into());
+        dx.events[0].labels = vec!["matador".into()];
         dx.events[0].rating = Some(5);
         dx.reviewed = true;
         let mut n = entry(
@@ -1809,11 +1814,7 @@ what is this
             x.file, "demos/archive/2026/09/21/X_pl_x.dem",
             "organize's move wins"
         );
-        assert_eq!(
-            x.events[0].label.as_deref(),
-            Some("matador"),
-            "wizard's label wins"
-        );
+        assert_eq!(x.events[0].labels, ["matador"], "wizard's label wins");
         assert_eq!(x.events[0].rating, Some(5));
         assert!(x.reviewed);
         assert_eq!(out.by_id("N").unwrap().file, "demos/N.dem");
