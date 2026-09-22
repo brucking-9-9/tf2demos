@@ -39,6 +39,12 @@ enum Command {
     Watch,
     /// Label unlabelled marks one card at a time.
     Review,
+    /// The manager window: browse, sort, filter and edit every mark (tabs Events / Demos / Review).
+    Gui {
+        /// Tab to open on: events, demos, or review.
+        #[arg(long, default_value = "events")]
+        tab: String,
+    },
     /// List every mark: demo, date, map, tick, time into the demo, wall-clock time, labels.
     Events {
         /// Only marks without a label.
@@ -107,6 +113,17 @@ fn main() -> Result<()> {
             let theme_path = config::Config::sibling_path(cli.config.as_deref(), "theme.toml");
             let theme = ui::theme::Theme::load(&theme_path);
             ui::run_review(&cfg, &theme)
+        }
+        Command::Gui { tab } => {
+            let theme_path = config::Config::sibling_path(cli.config.as_deref(), "theme.toml");
+            let theme = ui::theme::Theme::load(&theme_path);
+            let tab = match tab.as_str() {
+                "events" => ui::Tab::Events,
+                "demos" => ui::Tab::Demos,
+                "review" => ui::Tab::Review,
+                other => bail!("unknown tab {other:?}: use events, demos, or review"),
+            };
+            ui::run_gui(&cfg, &theme, tab)
         }
         Command::Play { id, tick } => play(&cfg, &id, tick),
         Command::Events { unlabelled, demo } => events(&cfg, unlabelled, demo.as_deref()),
