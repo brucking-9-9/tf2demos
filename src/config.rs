@@ -3,9 +3,6 @@
 //! The app never writes this file. When no file exists the built-in defaults apply, so the
 //! tool works before the HM module installs a config.
 
-// Consumed by archive.rs once it is wired in; remove when everything is used.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::path::{Path, PathBuf};
 

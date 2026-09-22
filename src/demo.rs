@@ -3,9 +3,6 @@
 //! Layout and formats: `HANDOFF.md` §2 "File formats". Nothing here touches the
 //! packet stream; the fixed 1072-byte header is all the organizer needs.
 
-// Consumed by `archive.rs`, which is still a stub; remove once it is wired in.
-#![allow(dead_code)]
-
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -89,6 +86,8 @@ impl Header {
     }
 
     /// `ticks == 0`: still recording, or never finalized (crash).
+    /// Reported by the GUI (later session); `organize` decides by age and sidecar only.
+    #[allow(dead_code)]
     pub fn is_in_progress(&self) -> bool {
         self.ticks == 0
     }

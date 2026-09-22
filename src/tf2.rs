@@ -7,9 +7,6 @@
 //! Test override: set `TF2DEMOS_TF2_RUNNING=1`/`true` to force "running" or `0`/`false` to force
 //! "not running", e.g. when exercising `organize` on a scratch copy while the real game is up.
 
-// Consumed by archive.rs once it is wired in; remove when everything is used.
-#![allow(dead_code)]
-
 use std::fs;
 use std::path::Path;
 

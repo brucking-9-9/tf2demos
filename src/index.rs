@@ -4,9 +4,6 @@
 //! streak / combo length), plus top-level `labels` (seeded from the config's `seed_labels` on
 //! first creation, growable afterwards) and `last_class`.
 
-// Consumed by archive.rs once it is wired in; remove when everything is used.
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -134,10 +131,14 @@ impl Index {
         result
     }
 
+    /// Lookup used by the labelling wizard (later session).
+    #[allow(dead_code)]
     pub fn by_id(&self, id: &str) -> Option<&DemoEntry> {
         self.demos.iter().find(|d| d.id == id)
     }
 
+    /// Lookup by the on-disk stem at archive time; `organize` matches via positions instead.
+    #[allow(dead_code)]
     pub fn by_original_name(&self, name: &str) -> Option<&DemoEntry> {
         self.demos.iter().find(|d| d.original_name == name)
     }
@@ -153,6 +154,8 @@ impl Index {
     }
 
     /// Add a label unless an identical (case-sensitive) one exists. Returns whether it was added.
+    /// Used by the labelling wizard (later session).
+    #[allow(dead_code)]
     pub fn add_label(&mut self, label: &str) -> bool {
         if self.labels.iter().any(|l| l == label) {
             return false;
