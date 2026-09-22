@@ -8,6 +8,15 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # winit/glutin dlopen these at run time (they are not DT_NEEDED), so both the devShell
+      # and the installed binary need them on LD_LIBRARY_PATH.
+      runtimeLibs = pkgs: with pkgs; [
+        wayland
+        libxkbcommon
+        libGL
+        vulkan-loader
+        fontconfig
+      ];
     in
     {
       packages = forAllSystems (pkgs: rec {
@@ -24,6 +33,15 @@
             ];
           };
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.makeWrapper
+          ];
+          buildInputs = runtimeLibs pkgs;
+          postFixup = ''
+            wrapProgram $out/bin/tf2demos \
+              --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (runtimeLibs pkgs)}
+          '';
           # `cargo test` runs in checkPhase (doCheck defaults to true).
           meta = {
             description = "Organize Team Fortress 2 demos recorded by the built-in ds_* support";
@@ -52,14 +70,18 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [
-            cargo
-            rustc
-            rust-analyzer
-            clippy
-            rustfmt
-          ];
+          packages =
+            (with pkgs; [
+              cargo
+              rustc
+              rust-analyzer
+              clippy
+              rustfmt
+              pkg-config
+            ])
+            ++ runtimeLibs pkgs;
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (runtimeLibs pkgs);
         };
       });
 

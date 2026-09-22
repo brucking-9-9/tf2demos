@@ -1,14 +1,18 @@
-//! TF2 process detection.
+//! TF2 process detection and play-at-tick.
 //!
-//! The only step of `organize` that cares whether TF2 is running is the `_events.txt` rewrite
-//! (ds appends to that file mid-game). Detection scans `/proc` directly: `pgrep -f` matched its
-//! own wrapper shell on this box, so we never shell out.
+//! `organize` cares whether TF2 is running for the `_events.txt` rewrite (ds appends to that file
+//! mid-game); the watcher polls it; `play` picks its branch by it. Detection scans `/proc`
+//! directly: `pgrep -f` matched its own wrapper shell on this box, so we never shell out.
 //!
 //! Test override: set `TF2DEMOS_TF2_RUNNING=1`/`true` to force "running" or `0`/`false` to force
 //! "not running", e.g. when exercising `organize` on a scratch copy while the real game is up.
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result};
 
 /// Process names of the TF2 game binary (64-bit and the legacy 32-bit launcher).
 const TF2_PROCESS_NAMES: &[&str] = &["tf_linux64", "hl2_linux"];
@@ -83,9 +87,162 @@ fn scan_proc(proc_root: &Path) -> bool {
         })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Play at tick (HANDOFF §4 "Playback helper")
+
+/// Steam app id of Team Fortress 2.
+pub const STEAM_APPID: &str = "440";
+
+/// What `play` will do, decided from the TF2 state so it can be unit-tested without a desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayPlan {
+    /// TF2 is running: the console command goes to the clipboard for the user to paste.
+    Clipboard { command: String },
+    /// TF2 is closed: launch through Steam with `+playdemo` / `+demo_gototick`; the gototick
+    /// line also goes to the clipboard in case the queued `+demo_gototick` is ignored at launch.
+    Launch {
+        steam_args: Vec<String>,
+        clipboard: String,
+    },
+}
+
+/// The in-game console form: `playdemo demos/x.dem; demo_gototick 6964`.
+pub fn console_command(rel: &str, tick: i64) -> String {
+    format!("playdemo {rel}; demo_gototick {tick}")
+}
+
+/// `rel` is the demo path relative to `tf/` (`demos/archive/2026/09/21/x.dem` or `demos/x.dem`).
+pub fn play_plan(rel: &str, tick: i64, running: bool) -> PlayPlan {
+    if running {
+        PlayPlan::Clipboard {
+            command: console_command(rel, tick),
+        }
+    } else {
+        PlayPlan::Launch {
+            steam_args: vec![
+                "-applaunch".into(),
+                STEAM_APPID.into(),
+                "-novid".into(),
+                "+playdemo".into(),
+                rel.into(),
+                "+demo_gototick".into(),
+                tick.to_string(),
+            ],
+            clipboard: format!("demo_gototick {tick}"),
+        }
+    }
+}
+
+/// Human-readable outcome of a plan, for the wizard's status line and `play`'s stdout.
+pub fn describe(plan: &PlayPlan) -> String {
+    match plan {
+        PlayPlan::Clipboard { command } => {
+            format!("TF2 is running: copied to clipboard, paste in console: {command}")
+        }
+        PlayPlan::Launch { steam_args, .. } => {
+            format!("launching TF2: steam {}", steam_args.join(" "))
+        }
+    }
+}
+
+/// Play `rel` at `tick`: clipboard when TF2 runs, Steam launch otherwise. Returns [`describe`].
+pub fn play(rel: &str, tick: i64) -> Result<String> {
+    let plan = play_plan(rel, tick, is_running());
+    execute(&plan)?;
+    Ok(describe(&plan))
+}
+
+fn execute(plan: &PlayPlan) -> Result<()> {
+    match plan {
+        PlayPlan::Clipboard { command } => {
+            wl_copy(command)?;
+            notify("tf2demos", "Copied to clipboard — paste in the TF2 console");
+        }
+        PlayPlan::Launch {
+            steam_args,
+            clipboard,
+        } => {
+            // Best effort: the launch is the point, the clipboard only the fallback.
+            if let Err(err) = wl_copy(clipboard) {
+                eprintln!("tf2demos: {err:#}");
+            }
+            // Detached (own process group, no pipes) so closing the wizard never takes TF2 down.
+            Command::new("steam")
+                .args(steam_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .context("launching `steam` (is it on PATH?)")?;
+        }
+    }
+    Ok(())
+}
+
+fn wl_copy(text: &str) -> Result<()> {
+    let status = Command::new("wl-copy")
+        .arg("--")
+        .arg(text)
+        .stdin(Stdio::null())
+        .status()
+        .context("running `wl-copy` (wl-clipboard on PATH, WAYLAND_DISPLAY set?)")?;
+    anyhow::ensure!(status.success(), "wl-copy exited with {status}");
+    Ok(())
+}
+
+/// Fire-and-forget desktop notification; failures are logged, never fatal.
+pub fn notify(summary: &str, body: &str) {
+    let r = Command::new("notify-send")
+        .args(["-a", "tf2demos", "--", summary, body])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
+    if let Err(err) = r {
+        eprintln!("tf2demos: notify-send failed: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn play_plan_running_goes_to_clipboard() {
+        let p = play_plan("demos/archive/2026/09/21/x_pl_badwater.dem", 6964, true);
+        assert_eq!(
+            p,
+            PlayPlan::Clipboard {
+                command: "playdemo demos/archive/2026/09/21/x_pl_badwater.dem; demo_gototick 6964"
+                    .into()
+            }
+        );
+        assert!(describe(&p).contains("paste in console"));
+    }
+
+    #[test]
+    fn play_plan_closed_launches_steam_with_fallback() {
+        let p = play_plan("demos/Tight_scout_m.dem", 2291, false);
+        assert_eq!(
+            p,
+            PlayPlan::Launch {
+                steam_args: vec![
+                    "-applaunch".into(),
+                    "440".into(),
+                    "-novid".into(),
+                    "+playdemo".into(),
+                    "demos/Tight_scout_m.dem".into(),
+                    "+demo_gototick".into(),
+                    "2291".into(),
+                ],
+                clipboard: "demo_gototick 2291".into(),
+            }
+        );
+        assert_eq!(
+            describe(&p),
+            "launching TF2: steam -applaunch 440 -novid +playdemo demos/Tight_scout_m.dem +demo_gototick 2291"
+        );
+    }
 
     #[test]
     fn override_forces_true() {
