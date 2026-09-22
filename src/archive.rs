@@ -11,6 +11,11 @@
 //! 4. `<archive>/by-label/` is deleted and regenerated from the index as relative symlinks;
 //! 5. the index is saved atomically.
 //!
+//! The review wizard (`review.rs`) indexes demos while they are still hot, so the index may
+//! already hold an entry for a demo being archived: [`Index::merge_archived`] keeps its labels,
+//! [`DemoEntry::is_archived`] keeps the fold from touching lines of hot demos, and entries whose
+//! hot file vanished (hand-deleted) are pruned unless they carry labels.
+//!
 //! `--dry-run` does all of it in memory and prints the same lines prefixed `[dry-run] `.
 
 use std::collections::HashSet;
@@ -40,6 +45,7 @@ pub struct Stats {
     pub orphans: usize,
     pub links: usize,
     pub skipped: usize,
+    pub pruned: usize,
 }
 
 /// What a run printed, for tests and callers that want more than the exit code.
@@ -99,6 +105,7 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
 
     // Steps 1–3: age, move or delete.
     let now = SystemTime::now();
+    let stale_ids = stale_hot_ids(cfg, &index);
     let mut loop_result = Ok(());
     for path in list_demos(&demos_dir)? {
         let r = process_demo(
@@ -107,6 +114,7 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
             &path,
             now,
             &mut index,
+            &stale_ids,
             &mut rep,
             &mut stats,
             write,
@@ -121,6 +129,9 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
         index.save(&index_path)?;
     }
     loop_result?;
+
+    // Hot entries whose file is gone (hand-deleted, or hand-renamed and not matched by header).
+    prune_stale_hot(cfg, &mut index, &mut rep, &mut stats);
 
     // Step 4: fold `_events.txt`.
     if tf2_running {
@@ -147,8 +158,14 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
     }
 
     rep.line(format!(
-        "DONE moved={} deleted={} folded={} orphans={} links={} skipped={}",
-        stats.moved, stats.deleted, stats.folded, stats.orphans, stats.links, stats.skipped
+        "DONE moved={} deleted={} folded={} orphans={} links={} skipped={} pruned={}",
+        stats.moved,
+        stats.deleted,
+        stats.folded,
+        stats.orphans,
+        stats.links,
+        stats.skipped,
+        stats.pruned
     ));
     Ok(Report {
         lines: rep.lines,
@@ -161,7 +178,7 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
 
 /// Every regular `*.dem` directly inside `demos_dir`, sorted by file name. A missing directory
 /// yields an empty list (dry-run against a wrong `tf_dir`).
-fn list_demos(demos_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn list_demos(demos_dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(demos_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -180,6 +197,36 @@ fn list_demos(demos_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     demos.sort();
     Ok(demos)
+}
+
+/// Ids of not-yet-archived entries whose `file` no longer exists: a hot demo the user renamed
+/// or deleted after the wizard indexed it.
+fn stale_hot_ids(cfg: &Config, index: &Index) -> Vec<String> {
+    index
+        .demos
+        .iter()
+        .filter(|d| !d.is_archived(&cfg.archive_dir) && !cfg.tf_dir.join(&d.file).is_file())
+        .map(|d| d.id.clone())
+        .collect()
+}
+
+/// Drop stale hot entries that carry no labels; keep (and report) labelled ones, since a label
+/// is never thrown away by this tool.
+fn prune_stale_hot(cfg: &Config, index: &mut Index, rep: &mut Reporter, stats: &mut Stats) {
+    let stale = stale_hot_ids(cfg, index);
+    for id in stale {
+        let labelled = index.by_id(&id).is_some_and(Index::has_labels);
+        if labelled {
+            rep.line(format!(
+                "SKIP missing {id} (labelled entry kept, file gone)"
+            ));
+            stats.skipped += 1;
+        } else {
+            rep.line(format!("PRUNE {id} (hot entry, file gone)"));
+            index.demos.retain(|d| d.id != id);
+            stats.pruned += 1;
+        }
+    }
 }
 
 /// Hours between `now` and `mtime`; negative when `mtime` lies in the future.
@@ -221,6 +268,7 @@ fn process_demo(
     path: &Path,
     now: SystemTime,
     index: &mut Index,
+    stale_ids: &[String],
     rep: &mut Reporter,
     stats: &mut Stats,
     write: bool,
@@ -293,7 +341,53 @@ fn process_demo(
         )?;
     }
 
-    let events: Vec<Event> = demo::group_marks(&sidecar.events, cfg.group_secs)
+    let events = events_from_sidecar(&sidecar, cfg.group_secs);
+    index.merge_archived(
+        DemoEntry {
+            id: stem.clone(),
+            file: rel_dest_str,
+            original_name: stem.clone(),
+            map: header.map,
+            server: header.server,
+            recorded_at: recorded,
+            seconds: header.seconds,
+            ticks: header.ticks,
+            state: State::Hot,
+            frozen_in: None,
+            reviewed: false,
+            events,
+        },
+        stale_ids,
+    );
+    // The day log shows the labels as they are now (the wizard may have set them while hot).
+    let merged = index
+        .by_id(&stem)
+        .expect("entry was just merged under this id");
+    let day_lines: Vec<String> = merged
+        .events
+        .iter()
+        .map(|e| {
+            format!(
+                "{new_name}  tick={} presses={} label={} class={} rating={} streak={}",
+                e.tick,
+                e.presses,
+                e.label.as_deref().unwrap_or("-"),
+                e.class.as_deref().unwrap_or("-"),
+                e.rating.map_or("-".to_string(), |r| r.to_string()),
+                e.streak.map_or("-".to_string(), |s| s.to_string()),
+            )
+        })
+        .collect();
+    if write {
+        append_lines(&dest_dir.join("events.txt"), &day_lines)?;
+    }
+    stats.moved += 1;
+    Ok(())
+}
+
+/// Unlabelled index events from a sidecar's marks, grouped with `group_secs`.
+pub fn events_from_sidecar(sidecar: &Sidecar, group_secs: f64) -> Vec<Event> {
+    demo::group_marks(&sidecar.events, group_secs)
         .into_iter()
         .map(|g| Event {
             tick: g.tick,
@@ -304,35 +398,7 @@ fn process_demo(
             rating: None,
             streak: None,
         })
-        .collect();
-    let day_lines: Vec<String> = events
-        .iter()
-        .map(|e| {
-            format!(
-                "{new_name}  tick={} presses={} label=- class=- rating=- streak=-",
-                e.tick, e.presses
-            )
-        })
-        .collect();
-    index.upsert(DemoEntry {
-        id: stem.clone(),
-        file: rel_dest_str,
-        original_name: stem,
-        map: header.map,
-        server: header.server,
-        recorded_at: recorded,
-        seconds: header.seconds,
-        ticks: header.ticks,
-        state: State::Hot,
-        frozen_in: None,
-        reviewed: false,
-        events,
-    });
-    if write {
-        append_lines(&dest_dir.join("events.txt"), &day_lines)?;
-    }
-    stats.moved += 1;
-    Ok(())
+        .collect()
 }
 
 /// Rename `src` to `dest` (copy + remove across filesystems) and verify the destination exists
@@ -436,18 +502,26 @@ pub enum Fate {
 
 /// Classify an event line against the in-memory index, the `.dem` stems currently on disk in
 /// `tf/demos`, and the cutoff before which a demo must be archived (`now − age_hours`).
+///
+/// Only **archived** entries (`file` below `archive_dir`) fold: the wizard indexes hot demos
+/// under the same ids, and their lines must stay in the master until they are moved.
 pub fn classify_fold(
     line: &EventsLine,
     index: &Index,
     on_disk: &HashSet<String>,
     hot_after: NaiveDateTime,
+    archive_dir: &Path,
 ) -> Fate {
     if let Some(pos) = index
         .demos
         .iter()
         .position(|d| d.original_name == line.demo)
     {
-        return Fate::Fold(pos);
+        return if index.demos[pos].is_archived(archive_dir) {
+            Fate::Fold(pos)
+        } else {
+            Fate::Keep
+        };
     }
     if on_disk.contains(&line.demo) {
         return Fate::Keep;
@@ -462,7 +536,11 @@ pub fn classify_fold(
             && d.events.iter().any(|e| e.raw_ticks.contains(&line.tick))
     });
     if let Some(pos) = hit {
-        return Fate::Fold(pos);
+        return if index.demos[pos].is_archived(archive_dir) {
+            Fate::Fold(pos)
+        } else {
+            Fate::Keep
+        };
     }
     // Younger than `age_hours`: cannot be archived yet, so a hand-renamed copy may still be
     // waiting in `tf/demos`. Keep the line until it can be matched.
@@ -492,6 +570,7 @@ pub fn plan_fold(
     index: &Index,
     on_disk: &HashSet<String>,
     hot_after: NaiveDateTime,
+    archive_dir: &Path,
 ) -> FoldPlan {
     let mut plan = FoldPlan::default();
     let mut blocks: Vec<(bool, Vec<&str>)> = vec![(false, Vec::new())];
@@ -505,7 +584,7 @@ pub fn plan_fold(
             continue;
         }
         match parse_events_line(trimmed) {
-            Some(ev) => match classify_fold(&ev, index, on_disk, hot_after) {
+            Some(ev) => match classify_fold(&ev, index, on_disk, hot_after, archive_dir) {
                 Fate::Fold(pos) => plan.folds.push((pos, trimmed.to_string())),
                 Fate::Orphan => plan.orphans.push(trimmed.to_string()),
                 Fate::Keep => blocks.last_mut().expect("seeded").1.push(trimmed),
@@ -560,7 +639,7 @@ fn fold_master(
     let on_disk = on_disk_stems(demos_dir)?;
     let hot_after = Local::now().naive_local()
         - chrono::Duration::milliseconds((cfg.age_hours * 3_600_000.0) as i64);
-    let plan = plan_fold(&master, index, &on_disk, hot_after);
+    let plan = plan_fold(&master, index, &on_disk, hot_after, &cfg.archive_dir);
 
     for (pos, raw) in &plan.folds {
         let entry = &index.demos[*pos];
@@ -670,14 +749,44 @@ pub fn by_label_links(entry: &DemoEntry) -> Vec<(String, String)> {
     }
 }
 
-/// Symlink target from `<archive>/by-label/<label>/` to the demo: `../../2026/09/21/x.dem`.
-/// `file` is the index path (relative to `tf_dir`); `archive_dir` the configured archive root.
-/// Falls back to the absolute path when `file` does not live below `archive_dir`.
+/// Symlink target from `<archive>/by-label/<label>/` to the demo: `../../2026/09/21/x.dem` for
+/// an archived demo, `../../../<stem>.dem` for one still in `tf/demos`. `file` is the index path
+/// (relative to `tf_dir`, or absolute); `archive_dir` the configured archive root. When one is
+/// absolute and the other relative no relative form exists, so the absolute path is used.
 pub fn relative_link_target(file: &str, archive_dir: &Path, tf_dir: &Path) -> PathBuf {
-    match Path::new(file).strip_prefix(archive_dir) {
-        Ok(inside) => Path::new("../..").join(inside),
-        Err(_) => tf_dir.join(file),
+    let file = Path::new(file);
+    let link_dir = archive_dir.join("by-label").join("label");
+    if file.is_absolute() != link_dir.is_absolute() {
+        return if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            tf_dir.join(file)
+        };
     }
+    let from: Vec<_> = link_dir.components().collect();
+    let to: Vec<_> = file.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for c in &to[common..] {
+        out.push(c);
+    }
+    out
+}
+
+/// Rebuild `<archive>/by-label/` from `index` right now (the wizard calls this after every save
+/// so a fresh label shows up without waiting for the nightly run). Returns the link count.
+pub fn rebuild_by_label(cfg: &Config, index: &Index) -> Result<usize> {
+    let mut rep = Reporter {
+        dry_run: false,
+        echo: false,
+        lines: Vec::new(),
+    };
+    let mut stats = Stats::default();
+    regenerate_by_label(cfg, &cfg.archive_path(), index, &mut rep, &mut stats, true)?;
+    Ok(stats.links)
 }
 
 fn regenerate_by_label(
@@ -693,6 +802,12 @@ fn regenerate_by_label(
         fs::remove_dir_all(&root).with_context(|| format!("removing {}", root.display()))?;
     }
     for entry in &index.demos {
+        // A link to a file that is gone would dangle; dry runs plan links for files not moved yet.
+        if write && !cfg.tf_dir.join(&entry.file).is_file() {
+            rep.line(format!("SKIP link, file missing {}", entry.file));
+            stats.skipped += 1;
+            continue;
+        }
         let target = relative_link_target(&entry.file, &cfg.archive_dir, &cfg.tf_dir);
         for (label, name) in by_label_links(entry) {
             rep.line(format!(
@@ -799,6 +914,7 @@ mod tests {
 
     /// `hot_after` value meaning "no ds timestamp is younger than age_hours".
     const NOTHING_HOT: NaiveDateTime = NaiveDateTime::MAX;
+    const ARCHIVE: &str = "demos/archive";
 
     #[test]
     fn parse_events_line_positive() {
@@ -942,8 +1058,20 @@ mod tests {
             Path::new("/tf"),
         );
         assert_eq!(t, PathBuf::from("../../2026/09/21/x.dem"));
+        // Hot demo in tf/demos: three levels up from by-label/<label>/.
+        let t = relative_link_target(
+            "demos/2026-09-21_19-51-20.dem",
+            Path::new("demos/archive"),
+            Path::new("/tf"),
+        );
+        assert_eq!(t, PathBuf::from("../../../2026-09-21_19-51-20.dem"));
         let t = relative_link_target("other/x.dem", Path::new("demos/archive"), Path::new("/tf"));
-        assert_eq!(t, PathBuf::from("/tf/other/x.dem"));
+        assert_eq!(t, PathBuf::from("../../../../other/x.dem"));
+        // Mixed absolute/relative: no relative form, use the absolute path.
+        let t = relative_link_target("demos/x.dem", Path::new("/abs/archive"), Path::new("/tf"));
+        assert_eq!(t, PathBuf::from("/tf/demos/x.dem"));
+        let t = relative_link_target("/abs/x.dem", Path::new("demos/archive"), Path::new("/tf"));
+        assert_eq!(t, PathBuf::from("/abs/x.dem"));
     }
 
     #[test]
@@ -955,41 +1083,95 @@ mod tests {
             tick,
         };
         assert_eq!(
-            classify_fold(&line("2026-09-21_19-51-20", 6964), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_19-51-20", 6964),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Fold(0)
         );
         // Original name wins even with a foreign tick.
         assert_eq!(
-            classify_fold(&line("2026-09-21_19-51-20", 1), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_19-51-20", 1),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Fold(0)
         );
         assert_eq!(
-            classify_fold(&line("2026-09-21_20-42-43", 5), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_20-42-43", 5),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Keep
         );
         // Hand-renamed: ds timestamp within 5 s of recorded_at and tick in raw_ticks.
         assert_eq!(
-            classify_fold(&line("2026-09-21_19-54-00", 2291), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_19-54-00", 2291),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Fold(1)
         );
         assert_eq!(
-            classify_fold(&line("2026-09-21_19-54-05", 2291), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_19-54-05", 2291),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Fold(1)
         );
         assert_eq!(
-            classify_fold(&line("2026-09-21_19-54-07", 2291), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_19-54-07", 2291),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Orphan
         );
         assert_eq!(
-            classify_fold(&line("2026-09-21_19-54-00", 2292), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-21_19-54-00", 2292),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Orphan
         );
         assert_eq!(
-            classify_fold(&line("2026-09-20_17-22-21", 601), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("2026-09-20_17-22-21", 601),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Orphan
         );
         assert_eq!(
-            classify_fold(&line("Nope", 601), &ix, &disk, NOTHING_HOT),
+            classify_fold(
+                &line("Nope", 601),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
             Fate::Orphan
         );
         // A ds line younger than age_hours may belong to a still-hot hand-renamed demo: keep.
@@ -998,9 +1180,73 @@ mod tests {
                 &line("2026-09-20_17-22-21", 601),
                 &ix,
                 &disk,
-                at(2026, 9, 20, 0, 0, 0)
+                at(2026, 9, 20, 0, 0, 0),
+                Path::new(ARCHIVE)
             ),
             Fate::Keep
+        );
+    }
+
+    #[test]
+    fn classify_keeps_lines_of_hot_indexed_demos() {
+        // The wizard indexed both demos while hot: same ids, files still in tf/demos.
+        let mut ix = test_index();
+        for d in &mut ix.demos {
+            d.file = format!("demos/{}.dem", d.id);
+        }
+        let disk: HashSet<String> = [
+            "2026-09-21_19-51-20".to_string(),
+            "Tight_scout_m".to_string(),
+        ]
+        .into();
+        let line = |demo: &str, tick| EventsLine {
+            demo: demo.into(),
+            tick,
+        };
+        assert_eq!(
+            classify_fold(
+                &line("2026-09-21_19-51-20", 6964),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
+            Fate::Keep
+        );
+        // Hand-renamed hot demo matched by timestamp + tick: still keep.
+        assert_eq!(
+            classify_fold(
+                &line("2026-09-21_19-54-00", 2291),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
+            Fate::Keep
+        );
+        // Once archived (file below archive_dir) the same lines fold.
+        for d in &mut ix.demos {
+            d.file = format!("demos/archive/2026/09/21/{}_pl_badwater.dem", d.id);
+        }
+        assert_eq!(
+            classify_fold(
+                &line("2026-09-21_19-51-20", 6964),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
+            Fate::Fold(0)
+        );
+        assert_eq!(
+            classify_fold(
+                &line("2026-09-21_19-54-00", 2291),
+                &ix,
+                &disk,
+                NOTHING_HOT,
+                Path::new(ARCHIVE)
+            ),
+            Fate::Fold(1)
         );
     }
 
@@ -1020,7 +1266,7 @@ what is this
 >
 [2026/09/21 19:54] Bookmark General (\"2026-09-21_19-54-00\" at 2291)
 ";
-        let plan = plan_fold(master, &ix, &disk, NOTHING_HOT);
+        let plan = plan_fold(master, &ix, &disk, NOTHING_HOT, Path::new(ARCHIVE));
         assert_eq!(plan.folds.len(), 2);
         assert_eq!(plan.folds[0].0, 0);
         assert_eq!(plan.folds[1].0, 1);
@@ -1038,6 +1284,7 @@ what is this
             &ix,
             &disk,
             NOTHING_HOT,
+            Path::new(ARCHIVE),
         );
         assert_eq!(plan.kept, "");
         // Lines before the first separator keep no separator.
@@ -1046,12 +1293,16 @@ what is this
             &ix,
             &disk,
             NOTHING_HOT,
+            Path::new(ARCHIVE),
         );
         assert_eq!(
             plan.kept,
             "[2026/09/21 20:50] Bookmark General (\"2026-09-21_20-42-43\" at 100)\n"
         );
-        assert_eq!(plan_fold("", &ix, &disk, NOTHING_HOT), FoldPlan::default());
+        assert_eq!(
+            plan_fold("", &ix, &disk, NOTHING_HOT, Path::new(ARCHIVE)),
+            FoldPlan::default()
+        );
     }
 
     // ---- end to end on a temp tree built from the fixtures ----------------------------------
@@ -1205,7 +1456,7 @@ what is this
         );
         assert_eq!(
             rep.lines.last().unwrap(),
-            "[dry-run] DONE moved=3 deleted=1 folded=3 orphans=2 links=3 skipped=1"
+            "[dry-run] DONE moved=3 deleted=1 folded=3 orphans=2 links=3 skipped=1 pruned=0"
         );
         fs::remove_dir_all(&t.root).unwrap();
     }
@@ -1222,7 +1473,8 @@ what is this
                 folded: 3,
                 orphans: 2,
                 links: 3,
-                skipped: 1
+                skipped: 1,
+                pruned: 0,
             }
         );
         let demos = t.root.join("tf/demos");
@@ -1346,6 +1598,186 @@ what is this
                 .count(),
             2
         );
+        fs::remove_dir_all(&t.root).unwrap();
+    }
+
+    /// The session-2 invariant: `organize` after `review` loses nothing.
+    #[test]
+    fn labels_on_hot_entries_survive_organize() {
+        let t = build_tree("labels");
+        let demos = t.root.join("tf/demos");
+        // The wizard indexed two hot demos and labelled one event each; a third hot entry's
+        // file was hand-deleted (unlabelled → pruned); a fourth was labelled then deleted (kept).
+        let mut ix = Index::new(&t.cfg.seed_labels);
+        let mut bad = entry(
+            "2026-09-21_19-51-20",
+            "pl_badwater",
+            at(2026, 9, 21, 19, 51, 20),
+            vec![event(6964, &[6964], Some("matador"), Some(4))],
+        );
+        bad.file = "demos/2026-09-21_19-51-20.dem".into();
+        bad.reviewed = true;
+        bad.events[0].class = Some("spy".into());
+        bad.events[0].streak = Some(2);
+        ix.upsert(bad);
+        let mut tight = entry(
+            "Tight_scout_m",
+            "pl_badwater",
+            at(2026, 9, 21, 19, 54, 1),
+            vec![event(2291, &[2291], Some("surf stab"), None)],
+        );
+        tight.file = "demos/Tight_scout_m.dem".into();
+        ix.upsert(tight);
+        let mut gone = entry(
+            "gone",
+            "pl_x",
+            at(2026, 9, 1, 0, 0, 0),
+            vec![event(1, &[1], None, None)],
+        );
+        gone.file = "demos/gone.dem".into();
+        ix.upsert(gone);
+        let mut gone_labelled = entry(
+            "gone_labelled",
+            "pl_x",
+            at(2026, 9, 2, 0, 0, 0),
+            vec![event(1, &[1], Some("c-tap"), None)],
+        );
+        gone_labelled.file = "demos/gone_labelled.dem".into();
+        ix.upsert(gone_labelled);
+        ix.add_label("free text");
+        ix.last_class = Some("spy".into());
+        ix.save(&t.cfg.index_path()).unwrap();
+        // Hot by-label links exist before the run (as the wizard would have made them).
+        rebuild_by_label(&t.cfg, &ix).unwrap();
+        assert!(
+            fs::metadata(
+                t.root
+                    .join("tf/demos/archive/by-label/matador/2026-09-21_pl_badwater_t6964_r4.dem")
+            )
+            .is_ok(),
+            "hot labelled link resolves before organize"
+        );
+
+        let rep = organize_with(&t.cfg, false, false, false).unwrap();
+        assert_eq!(rep.stats.moved, 3);
+        assert_eq!(rep.stats.pruned, 1);
+        assert!(
+            rep.lines
+                .iter()
+                .any(|l| l == "PRUNE gone (hot entry, file gone)"),
+            "{:?}",
+            rep.lines
+        );
+        assert!(
+            rep.lines
+                .iter()
+                .any(|l| l.starts_with("SKIP missing gone_labelled"))
+        );
+        assert_eq!(rep.stats.folded, 3, "archived lines fold as before");
+
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        let ids: Vec<&str> = ix.demos.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "2026-08-16_23-04-42",
+                "gone_labelled",
+                "2026-09-21_19-51-20",
+                "Tight_scout_m"
+            ]
+        );
+        let bad = ix.by_id("2026-09-21_19-51-20").unwrap();
+        assert_eq!(
+            bad.file,
+            "demos/archive/2026/09/21/2026-09-21_19-51-20_pl_badwater.dem"
+        );
+        assert!(bad.reviewed);
+        assert_eq!(bad.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(bad.events[0].class.as_deref(), Some("spy"));
+        assert_eq!(bad.events[0].rating, Some(4));
+        assert_eq!(bad.events[0].streak, Some(2));
+        let tight = ix.by_id("Tight_scout_m").unwrap();
+        assert_eq!(
+            tight.file,
+            "demos/archive/2026/09/21/Tight_scout_m_pl_badwater.dem"
+        );
+        assert_eq!(tight.events[0].label.as_deref(), Some("surf stab"));
+        assert!(!tight.reviewed);
+        assert_eq!(ix.labels.last().map(String::as_str), Some("free text"));
+        assert_eq!(ix.last_class.as_deref(), Some("spy"));
+        // Day log carries the labels; links moved from the hot path to the archive.
+        let day = fs::read_to_string(demos.join("archive/2026/09/21/events.txt")).unwrap();
+        assert!(
+            day.contains("tick=6964 presses=1 label=matador class=spy rating=4 streak=2"),
+            "{day}"
+        );
+        let link = demos.join("archive/by-label/matador/2026-09-21_pl_badwater_t6964_r4.dem");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            PathBuf::from("../../2026/09/21/2026-09-21_19-51-20_pl_badwater.dem")
+        );
+        assert!(fs::metadata(&link).is_ok(), "link resolves after the move");
+        assert!(
+            demos
+                .join("archive/by-label/surf stab/2026-09-21_pl_badwater_t2291_r0.dem")
+                .exists()
+        );
+        assert!(
+            !demos
+                .join("archive/by-label/unlabelled/Tight_scout_m_pl_badwater.dem")
+                .exists()
+        );
+        // The labelled-but-missing entry gets no dangling link.
+        assert!(!demos.join("archive/by-label/c-tap").exists());
+        fs::remove_dir_all(&t.root).unwrap();
+    }
+
+    /// Lines of hot demos indexed by the wizard stay in `_events.txt` until the demo moves.
+    #[test]
+    fn fold_keeps_lines_of_hot_indexed_demos_end_to_end() {
+        let t = build_tree("hotfold");
+        let cfg = Config::parse(&format!(
+            "tf_dir = {:?}\nage_hours = 1000000\n",
+            t.root.join("tf").to_string_lossy()
+        ))
+        .unwrap();
+        let mut ix = Index::new(&[]);
+        let mut bad = entry(
+            "2026-09-21_19-51-20",
+            "pl_badwater",
+            at(2026, 9, 21, 19, 51, 20),
+            vec![event(6964, &[6964], Some("matador"), None)],
+        );
+        bad.file = "demos/2026-09-21_19-51-20.dem".into();
+        ix.upsert(bad);
+        let mut tight = entry(
+            "Tight_scout_m",
+            "pl_badwater",
+            at(2026, 9, 21, 19, 54, 1),
+            vec![event(2291, &[2291], None, None)],
+        );
+        tight.file = "demos/Tight_scout_m.dem".into();
+        ix.upsert(tight);
+        ix.save(&cfg.index_path()).unwrap();
+        let master_before = fs::read_to_string(t.root.join("tf/demos/_events.txt")).unwrap();
+        let rep = organize_with(&cfg, false, false, false).unwrap();
+        assert_eq!(rep.stats.moved, 0);
+        assert_eq!(rep.stats.folded, 0);
+        assert!(lines_starting(&rep, "FOLD").is_empty());
+        // Nothing aged, so nothing changed in the master except the (age-independent) orphans.
+        let after = fs::read_to_string(t.root.join("tf/demos/_events.txt")).unwrap();
+        assert!(after.contains("\"2026-09-21_19-51-20\" at 6964"), "{after}");
+        assert!(after.contains("\"2026-09-21_19-54-00\" at 2291"), "{after}");
+        assert!(master_before.len() >= after.len());
+        // Hot links point three levels up and resolve.
+        let link = t
+            .root
+            .join("tf/demos/archive/by-label/matador/2026-09-21_pl_badwater_t6964_r0.dem");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            PathBuf::from("../../../2026-09-21_19-51-20.dem")
+        );
+        assert!(fs::metadata(&link).is_ok());
         fs::remove_dir_all(&t.root).unwrap();
     }
 

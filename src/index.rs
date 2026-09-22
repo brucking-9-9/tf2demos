@@ -45,6 +45,24 @@ pub struct DemoEntry {
     pub events: Vec<Event>,
 }
 
+impl DemoEntry {
+    /// True once `file` lies below the configured archive root (relative to `tf_dir`, or
+    /// absolute when `archive_dir` is). Hot demos indexed by the review wizard live in
+    /// `demos/<stem>.dem` and are not archived.
+    pub fn is_archived(&self, archive_dir: &Path) -> bool {
+        Path::new(&self.file).starts_with(archive_dir)
+    }
+
+    /// Stem of the file as it is on disk now (`2026-09-21_19-51-20_pl_badwater` or, while hot,
+    /// `2026-09-21_19-51-20`).
+    pub fn file_stem(&self) -> String {
+        Path::new(&self.file)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
@@ -131,10 +149,14 @@ impl Index {
         result
     }
 
-    /// Lookup used by the labelling wizard (later session).
-    #[allow(dead_code)]
+    /// Lookup by `id`.
     pub fn by_id(&self, id: &str) -> Option<&DemoEntry> {
         self.demos.iter().find(|d| d.id == id)
+    }
+
+    /// Mutable lookup by `id`.
+    pub fn by_id_mut(&mut self, id: &str) -> Option<&mut DemoEntry> {
+        self.demos.iter_mut().find(|d| d.id == id)
     }
 
     /// Lookup by the on-disk stem at archive time; `organize` matches via positions instead.
@@ -144,18 +166,92 @@ impl Index {
     }
 
     /// Replace the entry with the same `id`, or push. `demos` stays sorted by `(recorded_at, id)`.
+    ///
+    /// Blind replacement: labels on the old entry are lost. `organize` uses
+    /// [`Index::merge_archived`] instead; this stays for callers that build entries from scratch.
     pub fn upsert(&mut self, entry: DemoEntry) {
         match self.demos.iter_mut().find(|d| d.id == entry.id) {
             Some(existing) => *existing = entry,
             None => self.demos.push(entry),
         }
+        self.sort();
+    }
+
+    fn sort(&mut self) {
         self.demos
             .sort_by(|a, b| (a.recorded_at, &a.id).cmp(&(b.recorded_at, &b.id)));
     }
 
-    /// Add a label unless an identical (case-sensitive) one exists. Returns whether it was added.
-    /// Used by the labelling wizard (later session).
+    /// Record that `fresh` (built from the header and sidecar at archive time) has just been
+    /// archived, **keeping every label** the review wizard may already have stored.
+    ///
+    /// The existing entry is found by `id`, or — when the user hand-renamed the demo after it
+    /// was reviewed while hot — by an identical header (`server`, `map`, `ticks`, `seconds`) on a
+    /// not-yet-archived entry whose `file` is gone (`stale_ids` lists those). File-derived fields
+    /// (`file`, `map`, `server`, `recorded_at`, `seconds`, `ticks`, `id`, `original_name`) come
+    /// from `fresh`; `label/class/rating/streak` are copied per event matched by `tick`, else by
+    /// any shared `raw_ticks` entry; `reviewed` and `state`/`frozen_in` are kept.
+    pub fn merge_archived(&mut self, fresh: DemoEntry, stale_ids: &[String]) {
+        let pos = self
+            .demos
+            .iter()
+            .position(|d| d.id == fresh.id)
+            .or_else(|| {
+                self.demos.iter().position(|d| {
+                    stale_ids.contains(&d.id)
+                        && d.server == fresh.server
+                        && d.map == fresh.map
+                        && d.ticks == fresh.ticks
+                        && d.seconds == fresh.seconds
+                })
+            });
+        match pos {
+            Some(pos) => {
+                let old = std::mem::replace(&mut self.demos[pos], fresh);
+                let new = &mut self.demos[pos];
+                new.reviewed = old.reviewed;
+                new.state = old.state;
+                new.frozen_in = old.frozen_in;
+                let mut used = vec![false; old.events.len()];
+                for ev in &mut new.events {
+                    let hit = old
+                        .events
+                        .iter()
+                        .position(|o| o.tick == ev.tick)
+                        .or_else(|| {
+                            old.events
+                                .iter()
+                                .position(|o| o.raw_ticks.iter().any(|t| ev.raw_ticks.contains(t)))
+                        });
+                    if let Some(i) = hit {
+                        let o = &old.events[i];
+                        ev.label = o.label.clone();
+                        ev.class = o.class.clone();
+                        ev.rating = o.rating;
+                        ev.streak = o.streak;
+                        used[i] = true;
+                    }
+                }
+                // A labelled event that the fresh sidecar no longer lists is kept rather than lost.
+                for (o, used) in old.events.into_iter().zip(used) {
+                    if !used && o.label.is_some() {
+                        new.events.push(o);
+                    }
+                }
+                new.events.sort_by_key(|e| e.tick);
+            }
+            None => self.demos.push(fresh),
+        }
+        self.sort();
+    }
+
+    /// Positions of the entries that still hold labels somewhere.
     #[allow(dead_code)]
+    pub fn has_labels(entry: &DemoEntry) -> bool {
+        entry.events.iter().any(|e| e.label.is_some())
+    }
+
+    /// Add a label unless an identical (case-sensitive) one exists. Returns whether it was added.
     pub fn add_label(&mut self, label: &str) -> bool {
         if self.labels.iter().any(|l| l == label) {
             return false;
@@ -378,6 +474,136 @@ mod tests {
         );
         assert!(ix.by_id("nope").is_none());
         assert!(ix.by_original_name("nope").is_none());
+    }
+
+    fn labelled_hot() -> DemoEntry {
+        let mut e = badwater();
+        e.file = "demos/2026-09-21_19-51-20.dem".into();
+        e.events.push(Event {
+            tick: 9000,
+            presses: 1,
+            raw_ticks: vec![9000],
+            label: None,
+            class: None,
+            rating: None,
+            streak: None,
+        });
+        e
+    }
+
+    fn fresh_archived() -> DemoEntry {
+        let mut e = badwater();
+        e.reviewed = false;
+        e.events = vec![
+            Event {
+                tick: 6964,
+                presses: 1,
+                raw_ticks: vec![6964],
+                label: None,
+                class: None,
+                rating: None,
+                streak: None,
+            },
+            Event {
+                tick: 9000,
+                presses: 1,
+                raw_ticks: vec![9000],
+                label: None,
+                class: None,
+                rating: None,
+                streak: None,
+            },
+        ];
+        e
+    }
+
+    #[test]
+    fn is_archived_by_file_prefix() {
+        let hot = labelled_hot();
+        assert!(!hot.is_archived(Path::new("demos/archive")));
+        assert_eq!(hot.file_stem(), "2026-09-21_19-51-20");
+        let arch = badwater();
+        assert!(arch.is_archived(Path::new("demos/archive")));
+        assert_eq!(arch.file_stem(), "2026-09-21_19-51-20_pl_badwater");
+        let mut abs = badwater();
+        abs.file = "/elsewhere/2026/09/21/x.dem".into();
+        assert!(abs.is_archived(Path::new("/elsewhere")));
+        assert!(!abs.is_archived(Path::new("demos/archive")));
+    }
+
+    #[test]
+    fn merge_archived_keeps_labels_and_reviewed() {
+        let mut ix = Index::new(&[]);
+        ix.upsert(labelled_hot());
+        ix.merge_archived(fresh_archived(), &[]);
+        assert_eq!(ix.demos.len(), 1);
+        let d = &ix.demos[0];
+        assert!(
+            d.is_archived(Path::new("demos/archive")),
+            "file updated: {}",
+            d.file
+        );
+        assert!(d.reviewed, "reviewed kept");
+        assert_eq!(d.events.len(), 2);
+        assert_eq!(d.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(d.events[0].class.as_deref(), Some("spy"));
+        assert_eq!(d.events[0].rating, Some(4));
+        assert_eq!(d.events[0].streak, Some(1));
+        assert_eq!(d.events[1].label, None);
+    }
+
+    #[test]
+    fn merge_archived_matches_by_raw_tick_and_keeps_orphaned_labels() {
+        let mut ix = Index::new(&[]);
+        let mut old = labelled_hot();
+        // Labelled group starts at 6960 with 6964 inside; the fresh sidecar groups from 6964.
+        old.events[0].tick = 6960;
+        old.events[0].raw_ticks = vec![6960, 6964];
+        old.events.push(Event {
+            tick: 12000,
+            presses: 1,
+            raw_ticks: vec![12000],
+            label: Some("c-tap".into()),
+            class: None,
+            rating: None,
+            streak: None,
+        });
+        ix.upsert(old);
+        ix.merge_archived(fresh_archived(), &[]);
+        let d = &ix.demos[0];
+        let ticks: Vec<i64> = d.events.iter().map(|e| e.tick).collect();
+        assert_eq!(ticks, [6964, 9000, 12000]);
+        assert_eq!(d.events[0].label.as_deref(), Some("matador"));
+        assert_eq!(d.events[2].label.as_deref(), Some("c-tap"));
+    }
+
+    #[test]
+    fn merge_archived_adopts_hand_renamed_stale_entry() {
+        let mut ix = Index::new(&[]);
+        ix.upsert(labelled_hot());
+        let mut fresh = fresh_archived();
+        fresh.id = "Tight_scout_m".into();
+        fresh.original_name = "Tight_scout_m".into();
+        fresh.file = "demos/archive/2026/09/21/Tight_scout_m_pl_badwater.dem".into();
+        // Not stale: a second entry appears.
+        let mut probe = ix.clone();
+        probe.merge_archived(fresh.clone(), &[]);
+        assert_eq!(probe.demos.len(), 2);
+        // Stale (its file is gone) and the header matches: the entry is adopted with its labels.
+        ix.merge_archived(fresh, &["2026-09-21_19-51-20".to_string()]);
+        assert_eq!(ix.demos.len(), 1);
+        assert_eq!(ix.demos[0].id, "Tight_scout_m");
+        assert_eq!(ix.demos[0].events[0].label.as_deref(), Some("matador"));
+        assert!(ix.by_id("2026-09-21_19-51-20").is_none());
+    }
+
+    #[test]
+    fn merge_archived_new_entry_is_pushed_sorted() {
+        let mut ix = Index::new(&[]);
+        ix.upsert(entry("b", at(2026, 9, 21, 12, 0, 0)));
+        ix.merge_archived(entry("a", at(2026, 9, 20, 12, 0, 0)), &[]);
+        let ids: Vec<&str> = ix.demos.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
     }
 
     #[test]

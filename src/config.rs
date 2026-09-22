@@ -14,6 +14,7 @@ const DEFAULT_TF_DIR: &str =
 const DEFAULT_ARCHIVE_DIR: &str = "demos/archive";
 const DEFAULT_AGE_HOURS: f64 = 24.0;
 const DEFAULT_GROUP_SECS: f64 = 2.0;
+const DEFAULT_POLL_SECS: u64 = 5;
 const DEFAULT_SEED_LABELS: &[&str] = &["surf stab", "c-tap", "matador"];
 const DEFAULT_CLASSES: &[&str] = &[
     "scout", "soldier", "pyro", "demoman", "heavy", "engineer", "medic", "sniper", "spy",
@@ -32,6 +33,8 @@ pub struct Config {
     /// Marks within this many seconds of the previous mark merge into one event.
     #[serde(deserialize_with = "int_or_float")]
     pub group_secs: f64,
+    /// How often `tf2demos watch` checks whether TF2 is running.
+    pub poll_secs: u64,
     /// Copied into `index.json` on first creation; the index owns the live list afterwards.
     pub seed_labels: Vec<String>,
     /// TF2 class names offered by the labelling wizard.
@@ -45,6 +48,7 @@ impl Default for Config {
             archive_dir: PathBuf::from(DEFAULT_ARCHIVE_DIR),
             age_hours: DEFAULT_AGE_HOURS,
             group_secs: DEFAULT_GROUP_SECS,
+            poll_secs: DEFAULT_POLL_SECS,
             seed_labels: DEFAULT_SEED_LABELS.iter().map(|s| s.to_string()).collect(),
             classes: DEFAULT_CLASSES.iter().map(|s| s.to_string()).collect(),
         }
@@ -65,6 +69,24 @@ impl Config {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
         Self::load_from(path, xdg.as_deref(), home.as_deref())
+    }
+
+    /// Where a sibling of the config file lives (`theme.toml`): beside an explicit `--config`
+    /// path, else in the default config directory. The file need not exist.
+    pub fn sibling_path(explicit: Option<&Path>, name: &str) -> PathBuf {
+        if let Some(path) = explicit {
+            return path.with_file_name(name);
+        }
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        xdg.or_else(|| home.map(|h| h.join(".config")))
+            .unwrap_or_default()
+            .join("tf2demos")
+            .join(name)
     }
 
     /// Environment-free core of [`Config::load`]: the candidate directories are passed in.
@@ -169,6 +191,7 @@ mod tests {
         assert_eq!(c.archive_dir, PathBuf::from("demos/archive"));
         assert_eq!(c.age_hours, 24.0);
         assert_eq!(c.group_secs, 2.0);
+        assert_eq!(c.poll_secs, 5);
         assert_eq!(c.seed_labels, ["surf stab", "c-tap", "matador"]);
         assert_eq!(c.classes.len(), 9);
         assert_eq!(c.classes[0], "scout");
@@ -190,6 +213,7 @@ tf_dir      = "/scratch/tf"
 archive_dir = "demos/archive"
 age_hours   = 24
 group_secs  = 2.0
+poll_secs   = 3
 seed_labels = ["surf stab", "c-tap", "matador"]
 classes     = ["scout","soldier","pyro","demoman","heavy","engineer","medic","sniper","spy"]
 "#,
@@ -198,6 +222,7 @@ classes     = ["scout","soldier","pyro","demoman","heavy","engineer","medic","sn
         assert_eq!(c.tf_dir, PathBuf::from("/scratch/tf"));
         assert_eq!(c.age_hours, 24.0);
         assert_eq!(c.group_secs, 2.0);
+        assert_eq!(c.poll_secs, 3);
         assert_eq!(c.seed_labels.len(), 3);
         assert_eq!(c.classes.len(), 9);
     }
@@ -226,8 +251,9 @@ classes     = ["scout","soldier","pyro","demoman","heavy","engineer","medic","sn
 
     #[test]
     fn unknown_key_errors() {
-        let err = Config::parse("poll_secs = 5").unwrap_err();
-        assert!(err.to_string().contains("poll_secs"), "{err}");
+        let err = Config::parse("freeze_days = 30").unwrap_err();
+        assert!(err.to_string().contains("freeze_days"), "{err}");
+        assert!(Config::parse("poll_secs = -1").is_err());
     }
 
     #[test]
@@ -259,6 +285,16 @@ classes     = ["scout","soldier","pyro","demoman","heavy","engineer","medic","sn
         let c = Config::load_from(None, None, None).unwrap();
         assert_eq!(c.age_hours, 24.0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sibling_path_follows_explicit_config() {
+        assert_eq!(
+            Config::sibling_path(Some(Path::new("/scratch/cfg/config.toml")), "theme.toml"),
+            PathBuf::from("/scratch/cfg/theme.toml")
+        );
+        // Without an explicit path the result ends in tf2demos/theme.toml wherever it lands.
+        assert!(Config::sibling_path(None, "theme.toml").ends_with("tf2demos/theme.toml"));
     }
 
     #[test]
