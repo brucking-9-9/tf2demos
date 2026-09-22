@@ -31,6 +31,9 @@ pub struct EditPanel {
     class: Option<String>,
     rating: Option<u8>,
     streak: String,
+    /// Tick as typed; differs from the row's tick → the patch moves the mark.
+    tick: String,
+    orig_tick: i64,
     /// `l` / `t` pressed: focus that box next frame.
     pub focus_streak: bool,
     pub focus_free_text: bool,
@@ -49,6 +52,8 @@ impl EditPanel {
         self.class = row.class.clone();
         self.rating = row.rating;
         self.streak = row.streak.map(|s| s.to_string()).unwrap_or_default();
+        self.tick = row.tick.to_string();
+        self.orig_tick = row.tick;
     }
 
     pub fn clear(&mut self) {
@@ -98,7 +103,12 @@ impl EditPanel {
                 _ => return Err("streak must be a whole number ≥ 1 (blank = 1)".into()),
             },
         };
+        let tick = match self.tick.trim().parse::<i64>() {
+            Ok(t) if t >= 0 => t,
+            _ => return Err("tick must be a whole number ≥ 0".into()),
+        };
         Ok(EventPatch {
+            tick: (tick != self.orig_tick).then_some(tick),
             labels: Some(self.labels.clone()),
             class: Some(self.class.clone()),
             rating: Some(self.rating),
@@ -133,11 +143,24 @@ impl EditPanel {
                     .color(p.dim),
             );
         });
-        ui.label(
-            RichText::new(format!("{} · tick {}", row.demo_id, row.tick))
-                .small()
-                .color(p.dim),
-        );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&row.demo_id).small().color(p.dim));
+            ui.label(RichText::new("tick").small().color(p.dim));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tick)
+                    .desired_width(72.0)
+                    .font(egui::TextStyle::Small),
+            );
+            if let Ok(t) = self.tick.trim().parse::<i64>()
+                && t != self.orig_tick
+            {
+                ui.label(
+                    RichText::new(format!("→ {}", crate::review::format_offset(t)))
+                        .small()
+                        .color(p.yellow),
+                );
+            }
+        });
         ui.label(RichText::new(row.state_text()).small().color(p.dim));
         ui.separator();
 
@@ -305,5 +328,10 @@ mod tests {
         assert_eq!(p.streak, None);
         e.streak = "5".into();
         assert_eq!(e.patch().unwrap().streak, Some(Some(5)));
+        assert_eq!(e.patch().unwrap().tick, None, "unchanged tick is not sent");
+        e.tick = "42".into();
+        assert_eq!(e.patch().unwrap().tick, Some(42));
+        e.tick = "-1".into();
+        assert!(e.patch().is_err());
     }
 }

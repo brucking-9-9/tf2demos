@@ -61,6 +61,9 @@ enum Command {
         /// Tick of the mark (any tick of a grouped press works). Optional when the demo has one mark.
         #[arg(long)]
         tick: Option<i64>,
+        /// Move the mark to this tick (0..=demo length). Its ds press ticks are remembered.
+        #[arg(long)]
+        set_tick: Option<i64>,
         /// Set the tags (repeat for several; replaces the current set; new ones join the list).
         #[arg(long, conflicts_with = "clear_label")]
         label: Vec<String>,
@@ -92,6 +95,13 @@ enum Command {
         /// Mark the demo as reviewed even with unlabelled marks.
         #[arg(long)]
         reviewed: bool,
+    },
+    /// Rename a hot demo's .dem/.json pair in tf/demos (archived demos are never renamed).
+    Rename {
+        /// Index id or current file name.
+        id: String,
+        /// New name without extension, e.g. `Tight_scout_m`.
+        new_name: String,
     },
     /// Play a demo at a tick: launch TF2, or copy the console command when TF2 is running.
     Play {
@@ -130,6 +140,7 @@ fn main() -> Result<()> {
         Command::Edit {
             id,
             tick,
+            set_tick,
             label,
             add_label,
             remove_label,
@@ -143,6 +154,7 @@ fn main() -> Result<()> {
             reviewed,
         } => {
             let patch = review::EventPatch {
+                tick: set_tick,
                 labels: if clear_label {
                     Some(Vec::new())
                 } else if label.is_empty() {
@@ -173,16 +185,26 @@ fn main() -> Result<()> {
             };
             if patch == review::EventPatch::default() {
                 bail!(
-                    "nothing to change: pass --label/--add-label/--remove-label/--class/--rating/--streak, --clear-*, --requeue, or --reviewed"
+                    "nothing to change: pass --set-tick/--label/--add-label/--remove-label/--class/--rating/--streak, --clear-*, --requeue, or --reviewed"
                 );
             }
             let entry = review::edit_event(&cfg, &id, tick, &patch)?;
             print_events_header();
             for ev in &entry.events {
-                if tick.is_none_or(|t| ev.tick == t || ev.raw_ticks.contains(&t)) {
+                let hit = match (set_tick, tick) {
+                    (Some(new), _) => ev.tick == new,
+                    (None, Some(t)) => ev.tick == t || ev.raw_ticks.contains(&t),
+                    (None, None) => true,
+                };
+                if hit {
                     print_event(&cfg, &entry, ev);
                 }
             }
+            Ok(())
+        }
+        Command::Rename { id, new_name } => {
+            let entry = review::rename_demo(&cfg, &id, &new_name)?;
+            println!("{} -> {}", id, entry.file);
             Ok(())
         }
     }

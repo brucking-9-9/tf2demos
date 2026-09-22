@@ -149,8 +149,9 @@ pub fn organize_with(cfg: &Config, dry_run: bool, tf2_running: bool, echo: bool)
         )?;
     }
 
-    // Step 5: by-label symlinks.
+    // Step 5: by-label symlinks and the day event logs, both derived from the index.
     regenerate_by_label(cfg, &archive_path, &index, &mut rep, &mut stats, write)?;
+    regenerate_day_events(cfg, &index, write)?;
 
     // Step 6: index.
     if write && (index != loaded || !index_path.exists()) {
@@ -385,12 +386,25 @@ fn process_demo(
     let merged = index
         .by_id(&stem)
         .expect("entry was just merged under this id");
-    let day_lines: Vec<String> = merged
+    if write {
+        append_lines(&dest_dir.join("events.txt"), &day_lines_for(merged))?;
+    }
+    stats.moved += 1;
+    Ok(())
+}
+
+/// The index lines of one archived demo in its day `events.txt`.
+fn day_lines_for(entry: &DemoEntry) -> Vec<String> {
+    let name = Path::new(&entry.file)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    entry
         .events
         .iter()
         .map(|e| {
             format!(
-                "{new_name}  tick={} presses={} label={} class={} rating={} streak={}",
+                "{name}  tick={} presses={} label={} class={} rating={} streak={}",
                 e.tick,
                 e.presses,
                 e.labels_text(","),
@@ -399,12 +413,57 @@ fn process_demo(
                 e.streak.map_or("-".to_string(), |s| s.to_string()),
             )
         })
-        .collect();
-    if write {
-        append_lines(&dest_dir.join("events.txt"), &day_lines)?;
+        .collect()
+}
+
+/// Rewrite every day `events.txt` that has archived entries in `index`: the index lines first
+/// (demos by `recorded_at`, marks by tick), then the `# ds:` raw lines the fold appended, in
+/// their existing order. Editing a mark therefore edits the day file. Days without entries
+/// (all pruned) are left alone.
+pub fn regenerate_day_events(cfg: &Config, index: &Index, write: bool) -> Result<usize> {
+    let archive_path = cfg.archive_path();
+    let mut days: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for entry in &index.demos {
+        if !entry.is_archived(&cfg.archive_dir) {
+            continue;
+        }
+        let day = archive_path
+            .join(day_dir(entry.recorded_at))
+            .join("events.txt");
+        let lines = day_lines_for(entry);
+        match days.iter_mut().find(|(p, _)| *p == day) {
+            Some((_, v)) => v.extend(lines),
+            None => days.push((day, lines)),
+        }
     }
-    stats.moved += 1;
-    Ok(())
+    let mut changed = 0;
+    for (path, mut lines) in days {
+        let existing = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        lines.extend(
+            existing
+                .lines()
+                .filter(|l| l.starts_with("# ds:"))
+                .map(str::to_string),
+        );
+        let mut text = lines.join("\n");
+        text.push('\n');
+        if text == existing {
+            continue;
+        }
+        changed += 1;
+        if write {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            write_atomic(&path, &text)?;
+        }
+    }
+    Ok(changed)
 }
 
 /// Unlabelled index events from a sidecar's marks, grouped with `group_secs`.
@@ -801,9 +860,10 @@ pub fn relative_link_target(file: &str, archive_dir: &Path, tf_dir: &Path) -> Pa
     out
 }
 
-/// Rebuild `<archive>/by-label/` from `index` right now (the wizard calls this after every save
-/// so a fresh label shows up without waiting for the nightly run). Returns the link count.
-pub fn rebuild_by_label(cfg: &Config, index: &Index) -> Result<usize> {
+/// Rebuild everything derived from `index` right now: `<archive>/by-label/` and the day
+/// `events.txt` files (the wizard, `edit`, and the GUI call this after every save so a change
+/// shows up without waiting for the nightly run). Returns the link count.
+pub fn rebuild_derived(cfg: &Config, index: &Index) -> Result<usize> {
     let mut rep = Reporter {
         dry_run: false,
         echo: false,
@@ -811,6 +871,7 @@ pub fn rebuild_by_label(cfg: &Config, index: &Index) -> Result<usize> {
     };
     let mut stats = Stats::default();
     regenerate_by_label(cfg, &cfg.archive_path(), index, &mut rep, &mut stats, true)?;
+    regenerate_day_events(cfg, index, true)?;
     Ok(stats.links)
 }
 
@@ -1675,7 +1736,7 @@ what is this
         ix.last_class = Some("spy".into());
         ix.save(&t.cfg.index_path()).unwrap();
         // Hot by-label links exist before the run (as the wizard would have made them).
-        rebuild_by_label(&t.cfg, &ix).unwrap();
+        rebuild_derived(&t.cfg, &ix).unwrap();
         assert!(
             fs::metadata(
                 t.root
@@ -1827,6 +1888,51 @@ what is this
         assert_eq!(out.demos.len(), 1);
         assert_eq!(out.labels, ["seed"]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The day `events.txt` follows the index: edits rewrite the index lines, `# ds:` lines stay.
+    #[test]
+    fn day_events_regenerate_from_index() {
+        let t = build_tree("dayevents");
+        organize_with(&t.cfg, false, false, false).unwrap();
+        let day = t.root.join("tf/demos/archive/2026/09/21/events.txt");
+        let before = fs::read_to_string(&day).unwrap();
+        assert_eq!(before.lines().count(), 4);
+        // Unchanged index → nothing rewritten.
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        assert_eq!(regenerate_day_events(&t.cfg, &ix, true).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&day).unwrap(), before);
+        // Label + move the tick of the badwater mark: its line changes, order and # ds: lines stay.
+        let mut ix = ix;
+        let e = &mut ix.by_id_mut("2026-09-21_19-51-20").unwrap().events[0];
+        e.labels = vec!["matador".into(), "c-tap".into()];
+        e.tick = 7000;
+        assert_eq!(
+            regenerate_day_events(&t.cfg, &ix, false).unwrap(),
+            1,
+            "dry counts"
+        );
+        assert_eq!(
+            fs::read_to_string(&day).unwrap(),
+            before,
+            "dry run writes nothing"
+        );
+        rebuild_derived(&t.cfg, &ix).unwrap();
+        let after = fs::read_to_string(&day).unwrap();
+        assert_eq!(
+            after,
+            "2026-09-21_19-51-20_pl_badwater.dem  tick=7000 presses=1 label=matador,c-tap class=- rating=- streak=-\n\
+             Tight_scout_m_pl_badwater.dem  tick=2291 presses=1 label=- class=- rating=- streak=-\n\
+             # ds: [2026/09/21 19:53] Bookmark General (\"2026-09-21_19-51-20\" at 6964)\n\
+             # ds: [2026/09/21 19:54] Bookmark General (\"2026-09-21_19-54-00\" at 2291)\n"
+        );
+        assert!(
+            t.root
+                .join("tf/demos/archive/by-label/matador/2026-09-21_pl_badwater_t7000_r0.dem")
+                .exists(),
+            "link name follows the moved tick"
+        );
+        fs::remove_dir_all(&t.root).unwrap();
     }
 
     /// Lines of hot demos indexed by the wizard stay in `_events.txt` until the demo moves.

@@ -88,6 +88,8 @@ struct GuiApp {
     selected: Option<(String, i64)>,
     selected_demo: Option<String>,
     demo_filter: String,
+    /// Rename box on the Demos tab (hot demos only).
+    rename_to: String,
     edit: EditPanel,
     wizard: Option<ReviewApp>,
     awaiting_rating: bool,
@@ -107,6 +109,7 @@ impl GuiApp {
             selected: None,
             selected_demo,
             demo_filter: String::new(),
+            rename_to: String::new(),
             edit: EditPanel::default(),
             wizard: None,
             awaiting_rating: false,
@@ -262,11 +265,15 @@ impl GuiApp {
             EditAction::Invalid(msg) => self.error(msg),
             EditAction::Play => self.play_selected(),
             EditAction::Save(patch) => {
+                let new_tick = patch.tick.unwrap_or(tick);
                 match review::edit_event(&self.lib.cfg, &id, Some(tick), &patch) {
                     Ok(_) => {
                         self.info("saved");
                         self.reload();
                         self.wizard = None;
+                        // Re-read the draft from disk (and follow a moved tick).
+                        self.selected = Some((id, new_tick));
+                        self.edit.clear();
                     }
                     Err(err) => self.error(format!("{err:#}")),
                 }
@@ -671,6 +678,35 @@ impl GuiApp {
                 .small()
                 .color(p.dim),
         );
+        if !demo.is_archived(&self.lib.cfg.archive_dir) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("rename").small().color(p.green));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.rename_to)
+                        .hint_text(&demo.id)
+                        .desired_width(260.0),
+                );
+                let go = (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                    || ui.button("rename files").clicked();
+                if go && !self.rename_to.trim().is_empty() {
+                    let new_name = self.rename_to.trim().to_string();
+                    match review::rename_demo(&self.lib.cfg, &id, &new_name) {
+                        Ok(e) => {
+                            self.info(format!("renamed to {}", e.file));
+                            self.selected_demo = Some(e.id.clone());
+                            if let Some((_, t)) = self.selected.take() {
+                                self.selected = Some((e.id, t));
+                            }
+                            self.edit.clear();
+                            self.rename_to.clear();
+                            self.reload();
+                            self.wizard = None;
+                        }
+                        Err(err) => self.error(format!("{err:#}")),
+                    }
+                }
+            });
+        }
         ui.add_space(6.0);
         let selected_tick = self
             .selected

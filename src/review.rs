@@ -68,6 +68,9 @@ pub fn mark_time(recorded_at: NaiveDateTime, tick: i64) -> NaiveDateTime {
 /// alone; inner `None` = clear.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EventPatch {
+    /// Move the mark to this tick (`0 ..= demo ticks`, unique within the demo). The ds press
+    /// ticks (`raw_ticks`) are kept, so the nightly archive still recognises the mark.
+    pub tick: Option<i64>,
     /// Replace the tag set (`Some(vec![])` clears it).
     pub labels: Option<Vec<String>>,
     /// Tags to add / remove after `labels` is applied.
@@ -132,6 +135,24 @@ pub fn edit_event(
             n => bail!("{} has {n} events; pass --tick", entry.id),
         },
     };
+    if let Some(new_tick) = patch.tick {
+        if new_tick < 0 || (entry.ticks > 0 && new_tick > i64::from(entry.ticks)) {
+            bail!(
+                "tick {new_tick} is outside {} (0..={})",
+                entry.id,
+                entry.ticks
+            );
+        }
+        if entry
+            .events
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i != pos && e.tick == new_tick)
+        {
+            bail!("{} already has a mark at tick {new_tick}", entry.id);
+        }
+        entry.events[pos].tick = new_tick;
+    }
     let ev = &mut entry.events[pos];
     let was_labelled = ev.is_labelled();
     if let Some(labels) = &patch.labels {
@@ -172,6 +193,7 @@ pub fn edit_event(
         None if unlabelled_now => false,
         None => entry.reviewed || entry.events.iter().all(Event::is_labelled),
     };
+    entry.events.sort_by_key(|e| e.tick);
     let result = entry.clone();
     for l in &new_labels {
         ix.add_label(l);
@@ -180,7 +202,75 @@ pub fn edit_event(
         ix.last_class = new_class;
     }
     ix.save(&path)?;
-    archive::rebuild_by_label(cfg, &ix)?;
+    archive::rebuild_derived(cfg, &ix)?;
+    Ok(result)
+}
+
+/// Rename a **hot** demo's files (`<stem>.dem` + `.json` in `tf/demos`) to `<new_stem>` and
+/// re-key its index entry (`id`, `file`); `original_name` keeps the first-seen name so the ds
+/// log lines still match. Archived demos are refused: the archive is never touched.
+pub fn rename_demo(cfg: &Config, key: &str, new_stem: &str) -> Result<DemoEntry> {
+    let new_stem = new_stem.trim().trim_end_matches(".dem");
+    if new_stem.is_empty()
+        || new_stem.contains('/')
+        || new_stem.contains('\\')
+        || new_stem == "."
+        || new_stem == ".."
+    {
+        bail!("invalid demo name {new_stem:?}");
+    }
+    let scanned = scan(cfg)?;
+    let found = find_demo(&scanned.index, key)
+        .cloned()
+        .with_context(|| format!("no demo matches {key:?}"))?;
+    if found.is_archived(&cfg.archive_dir) {
+        bail!(
+            "{} is archived; only demos still in tf/demos can be renamed",
+            found.id
+        );
+    }
+    if found.id == new_stem {
+        return Ok(found);
+    }
+    let demos = cfg.demos_dir();
+    let src = cfg.tf_dir.join(&found.file);
+    let dst = demos.join(format!("{new_stem}.dem"));
+    if !src.is_file() {
+        bail!("{} is missing on disk", src.display());
+    }
+    if dst.exists() || demos.join(format!("{new_stem}.json")).exists() {
+        bail!("{new_stem} already exists in tf/demos");
+    }
+    if scanned.index.by_id(new_stem).is_some() {
+        bail!("the index already has a demo called {new_stem}");
+    }
+    let src_json = src.with_extension("json");
+    fs::rename(&src, &dst)
+        .with_context(|| format!("renaming {} to {}", src.display(), dst.display()))?;
+    if src_json.is_file() {
+        let dst_json = dst.with_extension("json");
+        if let Err(err) = fs::rename(&src_json, &dst_json) {
+            // Put the .dem back so the pair never splits.
+            let _ = fs::rename(&dst, &src);
+            return Err(err).with_context(|| format!("renaming {}", src_json.display()));
+        }
+    }
+    let path = cfg.index_path();
+    let mut ix = Index::load_or_new(&path, &cfg.seed_labels)?;
+    if ix.by_id(&found.id).is_none() {
+        ix.upsert(found.clone());
+    }
+    let entry = ix.by_id_mut(&found.id).expect("just ensured");
+    entry.id = new_stem.to_string();
+    entry.file = Path::new("demos")
+        .join(format!("{new_stem}.dem"))
+        .to_string_lossy()
+        .into_owned();
+    let result = entry.clone();
+    ix.demos
+        .sort_by(|a, b| (a.recorded_at, &a.id).cmp(&(b.recorded_at, &b.id)));
+    ix.save(&path)?;
+    archive::rebuild_derived(cfg, &ix)?;
     Ok(result)
 }
 
@@ -310,7 +400,7 @@ impl Session {
         let index = scan.index;
         if !scan.added.is_empty() {
             index.save(&cfg.index_path())?;
-            archive::rebuild_by_label(cfg, &index)?;
+            archive::rebuild_derived(cfg, &index)?;
         }
         let cards = queue(&index);
         Ok(Session {
@@ -444,7 +534,7 @@ impl Session {
                 .all(|e| e.is_labelled() || skipped.contains(&(entry.id.clone(), e.tick)));
         }
         ix.save(&path)?;
-        archive::rebuild_by_label(&self.cfg, &ix)?;
+        archive::rebuild_derived(&self.cfg, &ix)?;
         self.index = ix;
         Ok(())
     }
@@ -695,6 +785,174 @@ mod tests {
         let err =
             edit_event(&t.cfg, "2026-08-16_23-04-42", None, &EventPatch::default()).unwrap_err();
         assert!(err.to_string().contains("--tick"), "{err}");
+        fs::remove_dir_all(&t.root).unwrap();
+    }
+
+    #[test]
+    fn edit_event_moves_tick_and_organize_keeps_it() {
+        let t = build_tree("tick");
+        let e = edit_event(
+            &t.cfg,
+            "2026-09-21_19-51-20",
+            None,
+            &EventPatch {
+                tick: Some(6900),
+                labels: Some(vec!["matador".into()]),
+                ..EventPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.events[0].tick, 6900);
+        assert_eq!(e.events[0].raw_ticks, [6964]);
+        // The raw ds tick still addresses the mark; the moved tick does too.
+        assert!(
+            edit_event(
+                &t.cfg,
+                "2026-09-21_19-51-20",
+                Some(6964),
+                &EventPatch::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            edit_event(
+                &t.cfg,
+                "2026-09-21_19-51-20",
+                Some(6900),
+                &EventPatch::default()
+            )
+            .is_ok()
+        );
+        for bad in [-1, 7000] {
+            let err = edit_event(
+                &t.cfg,
+                "2026-09-21_19-51-20",
+                None,
+                &EventPatch {
+                    tick: Some(bad),
+                    ..EventPatch::default()
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("outside"), "{err}");
+        }
+        assert!(
+            t.root
+                .join("tf/demos/archive/by-label/matador/2026-09-21_pl_badwater_t6900_r0.dem")
+                .exists()
+        );
+        // Archive it: the sidecar still says 6964 but the moved tick and label survive.
+        let cfg0 = Config::parse(&format!(
+            "tf_dir = {:?}\nage_hours = 0\n",
+            t.root.join("tf").to_string_lossy()
+        ))
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60);
+        for ext in ["dem", "json"] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(t.root.join(format!("tf/demos/2026-09-21_19-51-20.{ext}")))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        archive::organize_with(&cfg0, false, false, false).unwrap();
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        let d = ix.by_id("2026-09-21_19-51-20").unwrap();
+        assert!(d.is_archived(Path::new("demos/archive")));
+        assert_eq!(d.events[0].tick, 6900);
+        assert_eq!(d.events[0].labels, ["matador"]);
+        let day =
+            fs::read_to_string(t.root.join("tf/demos/archive/2026/09/21/events.txt")).unwrap();
+        assert!(day.contains("tick=6900 presses=1 label=matador"), "{day}");
+        fs::remove_dir_all(&t.root).unwrap();
+    }
+
+    #[test]
+    fn rename_demo_moves_pair_and_rekeys_entry() {
+        let t = build_tree("rename");
+        let demos = t.root.join("tf/demos");
+        // Label first so the label follows the rename.
+        edit_event(
+            &t.cfg,
+            "2026-09-21_19-51-20",
+            None,
+            &EventPatch {
+                labels: Some(vec!["matador".into()]),
+                ..EventPatch::default()
+            },
+        )
+        .unwrap();
+        let e = rename_demo(&t.cfg, "2026-09-21_19-51-20", "Nice stab.dem").unwrap();
+        assert_eq!(e.id, "Nice stab");
+        assert_eq!(e.file, "demos/Nice stab.dem");
+        assert_eq!(e.original_name, "2026-09-21_19-51-20");
+        assert!(demos.join("Nice stab.dem").is_file());
+        assert!(demos.join("Nice stab.json").is_file());
+        assert!(!demos.join("2026-09-21_19-51-20.dem").exists());
+        assert!(!demos.join("2026-09-21_19-51-20.json").exists());
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        assert!(ix.by_id("2026-09-21_19-51-20").is_none());
+        assert_eq!(ix.by_id("Nice stab").unwrap().events[0].labels, ["matador"]);
+        assert_eq!(
+            find_demo(&ix, "2026-09-21_19-51-20").unwrap().id,
+            "Nice stab",
+            "old name still resolves"
+        );
+        let link = demos.join("archive/by-label/matador/2026-09-21_pl_badwater_t6964_r0.dem");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            PathBuf::from("../../../Nice stab.dem")
+        );
+        assert!(fs::metadata(&link).is_ok());
+        // Refusals: archived, collisions, bad names, unknown.
+        assert!(
+            rename_demo(&t.cfg, "2026-08-16_23-04-42", "x")
+                .unwrap_err()
+                .to_string()
+                .contains("archived")
+        );
+        assert!(
+            rename_demo(&t.cfg, "Nice stab", "2026-09-21_00-00-37")
+                .unwrap_err()
+                .to_string()
+                .contains("exists")
+        );
+        assert!(rename_demo(&t.cfg, "Nice stab", "a/b").is_err());
+        assert!(rename_demo(&t.cfg, "Nice stab", "").is_err());
+        assert!(rename_demo(&t.cfg, "nope", "x").is_err());
+        assert_eq!(
+            rename_demo(&t.cfg, "Nice stab", "Nice stab").unwrap().id,
+            "Nice stab"
+        );
+        // Archive it under the new name; the ds line folds via original_name.
+        let cfg0 = Config::parse(&format!(
+            "tf_dir = {:?}\nage_hours = 0\n",
+            t.root.join("tf").to_string_lossy()
+        ))
+        .unwrap();
+        fs::write(
+            demos.join("_events.txt"),
+            ">\n[2026/09/21 19:53] Bookmark General (\"2026-09-21_19-51-20\" at 6964)\n",
+        )
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60);
+        for ext in ["dem", "json"] {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(demos.join(format!("Nice stab.{ext}")))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let rep = archive::organize_with(&cfg0, false, false, false).unwrap();
+        assert_eq!(rep.stats.folded, 1, "{:?}", rep.lines);
+        let ix = Index::load_or_new(&t.cfg.index_path(), &[]).unwrap();
+        let d = ix.by_id("Nice stab").unwrap();
+        assert_eq!(d.file, "demos/archive/2026/09/21/Nice stab_pl_badwater.dem");
+        assert_eq!(d.original_name, "2026-09-21_19-51-20");
+        assert_eq!(d.events[0].labels, ["matador"]);
+        assert_eq!(fs::read_to_string(demos.join("_events.txt")).unwrap(), "");
         fs::remove_dir_all(&t.root).unwrap();
     }
 

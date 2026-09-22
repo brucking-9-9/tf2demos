@@ -254,6 +254,9 @@ impl Index {
                 new.reviewed = old.reviewed;
                 new.state = old.state;
                 new.frozen_in = old.frozen_in;
+                // The name the demo was first seen under (ds name) keeps `_events.txt` lines
+                // matching after a rename.
+                new.original_name = old.original_name.clone();
                 let mut used = vec![false; old.events.len()];
                 for ev in &mut new.events {
                     let hit = old
@@ -267,6 +270,8 @@ impl Index {
                         });
                     if let Some(i) = hit {
                         let o = &old.events[i];
+                        // A tick the user moved wins over the sidecar's grouping.
+                        ev.tick = o.tick;
                         ev.labels = o.labels.clone();
                         ev.class = o.class.clone();
                         ev.rating = o.rating;
@@ -281,6 +286,7 @@ impl Index {
                     }
                 }
                 new.events.sort_by_key(|e| e.tick);
+                new.events.dedup_by_key(|e| e.tick);
             }
             None => self.demos.push(fresh),
         }
@@ -659,9 +665,31 @@ mod tests {
         ix.merge_archived(fresh_archived(), &[]);
         let d = &ix.demos[0];
         let ticks: Vec<i64> = d.events.iter().map(|e| e.tick).collect();
-        assert_eq!(ticks, [6964, 9000, 12000]);
+        // The indexed tick wins over the sidecar's regrouping (it may have been moved by hand).
+        assert_eq!(ticks, [6960, 9000, 12000]);
         assert_eq!(d.events[0].labels, ["matador"]);
+        assert_eq!(d.events[0].raw_ticks, [6964]);
         assert_eq!(d.events[2].labels, ["c-tap"]);
+    }
+
+    #[test]
+    fn merge_archived_keeps_moved_tick_and_original_name() {
+        let mut ix = Index::new(&[]);
+        let mut old = labelled_hot();
+        old.original_name = "2026-09-21_19-50-00".into();
+        old.events[0].tick = 7000; // moved by the user; raw_ticks still [6964]
+        ix.upsert(old);
+        ix.merge_archived(fresh_archived(), &[]);
+        let d = &ix.demos[0];
+        assert_eq!(d.original_name, "2026-09-21_19-50-00");
+        let ticks: Vec<i64> = d.events.iter().map(|e| e.tick).collect();
+        assert_eq!(ticks, [7000, 9000]);
+        assert_eq!(d.events[0].labels, ["matador"]);
+        assert_eq!(
+            d.events[0].raw_ticks,
+            [6964],
+            "raw ds ticks come from the sidecar"
+        );
     }
 
     #[test]
